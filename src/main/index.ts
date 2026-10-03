@@ -8,11 +8,9 @@ import { join, dirname } from 'node:path'
 import { NativeAudioOut, type AudioOutConfig } from './audio-out'
 import { startMcpServer, mcpLog, mcpRendererReset } from './mcp'
 
-// 当面のテストベッド: 起動時にこのフォルダの WAV を全部トラックとして自動ロード。
-// `DAW_AUTOLOAD` で差し替え、`DAW_AUTOLOAD=` (空) で無効化。不要になったら消す。
-const AUTOLOAD_DIR =
-  process.env['DAW_AUTOLOAD'] ??
-  'C:\\Users\\****\\Documents\\リファレンス音源\\MoniBlue_AprilBlues'
+// 当面のテストベッド: `DAW_AUTOLOAD=<dir>` を指定すると、保存済みプロジェクトが無い
+// 起動時にそのフォルダの WAV を全部トラックとして自動ロード。未設定 / 空なら無効。
+const AUTOLOAD_DIR = process.env['DAW_AUTOLOAD'] ?? ''
 
 // Main + preload are built as CJS by electron-vite (no "type": "module" in
 // package.json), so __dirname is available directly. See docs/ARCHITECTURE.md.

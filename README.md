@@ -64,10 +64,9 @@ Phase 0（GPGPU 再生経路）は実機で鳴っている。以降は DAW の�
   左＝番号+ファイル名、中央＝波形、右＝予約）。波形はダーク／ブライトの
   エメラルド。Add Track ウィザードで **複数 WAV を一括選択 → 本数ぶんレーン**、
   トラック名はファイル名から自動。
-- **テストベッド自動ロード**（当面）: 起動時に
-  `C:\Users\****\Documents\リファレンス音源\MoniBlue_AprilBlues` の WAV を
-  全部トラックとして読み込む。`DAW_AUTOLOAD=<dir>` で差し替え、`DAW_AUTOLOAD=`
-  （空）で無効化。`?selftest` 起動時は自動ロードしない。
+- **テストベッド自動ロード**（当面）: `DAW_AUTOLOAD=<dir>` を指定すると、保存済み
+  プロジェクトが無い起動時にそのフォルダの WAV を全部トラックとして読み込む。
+  未設定 / 空なら無効（既定）。`?selftest` 起動時は自動ロードしない。
 - **再生中 GPU 負荷対策**: 波形は dirty 時＋画面内レーンのみ再描画（定常再生中は
   0 サブミット）。先読みブロック 32768 フレーム（読み戻し ~6 回/秒）、
   staging / bindgroup / スクラッチ配列を使い回し。main の ring コピーは memcpy 化。
@@ -391,7 +390,7 @@ ML 系）が GPU バウンドと分かったら **そのカーネルだけ** mai
 - マルチトラック mix はトラック毎に別 compute パス（同一 encoder）で `outP` を
   RMW。WebGPU はパス間で storage 書き込みを可視化するので順序は安全。
 - 複数 WAV の SR が違っても各自プロジェクト SR へリサンプルされる（追従なし）。
-- テストベッド自動ロードのパスはコード内ハードコード（`DAW_AUTOLOAD` で上書き可、
+- テストベッド自動ロードは `DAW_AUTOLOAD=<dir>` 指定時のみ有効（既定は無効。
   不要になったら `src/main/index.ts` から消す）。
 
 ---
@@ -665,8 +664,7 @@ interleave → 読み戻し → RtAudio/WASAPI 出力`。全部 GPU で 1 エン
   ロードマップ → セッションログ）。`CLAUDE.md` は不変条件と環境の落とし穴だけの
   短い版に整理し「詳細は README.md」を指す。メモリ `gpudaw-project` も更新。
 - **テストベッド自動ロード**: 起動時（`?selftest` 以外）に main の `AUTOLOAD_DIR`
-  （既定 `…\リファレンス音源\MoniBlue_AprilBlues`、`DAW_AUTOLOAD` で上書き / 空で
-  無効）の WAV を `daw:autoloadWavs` で列挙 → `loadFiles()` で全部トラック化。
+  （`DAW_AUTOLOAD=<dir>` 指定時のみ。未設定 / 空なら無効）の WAV を `daw:autoloadWavs` で列挙 → `loadFiles()` で全部トラック化。
   当面のテストベッド、不要になったら `src/main/index.ts` から消す。
 - **今の状態**: `typecheck` グリーン。ユーザーが起動して MoniBlue_AprilBlues の
   パラが自動で並ぶか要確認。
