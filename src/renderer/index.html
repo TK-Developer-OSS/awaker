@@ -1,0 +1,1117 @@
+<!doctype html>
+<!-- Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer) -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Generated with Claude Code (https://claude.com/claude-code) -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    />
+    <title>Awaker DAW over GPU</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0d12;
+        --panel: #12151c;
+        --line: #232833;
+        --text: #d7dbe4;
+        --dim: #7d8697;
+        --accent: #4da3ff;
+        --play: #37d67a;
+        /* emerald track palette */
+        --emerald: #34d399;
+        --emerald-bar: #04231b;
+        --emerald-edge: #0e3a2d;
+        /* layout metrics */
+        --lane-h: 50px;
+        --lane-left: 160px;
+        --lane-right: 120px;
+        --pane-side: 264px;
+        --pane-vert: 510px;
+        --warn: #ffb454;
+        --rec: #ff5c5c;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      /* ---- transport bar ---- */
+      #transport {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 12px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--line);
+        user-select: none;
+      }
+      #transport button {
+        background: #1b2029;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 12px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #transport button:hover { border-color: var(--accent); }
+      #transport button:disabled { opacity: 0.4; cursor: default; }
+      #transport button.playing { color: var(--play); border-color: var(--play); }
+      #transport button#rec { color: var(--rec); }
+      #transport button#rec.recording { background: var(--rec); color: #1a0505; border-color: var(--rec); }
+      .td-btns select.rec-in { width: 56px; margin-top: 4px; font-size: 11px; }
+      #add-track { color: var(--emerald); border-color: var(--emerald-edge); }
+      #add-track:hover { border-color: var(--emerald); }
+      #toolbar { display: inline-flex; gap: 3px; }
+      #transport #toolbar button.tool {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 5px 9px;
+        font-size: 12px;
+        border-radius: 4px;
+      }
+      #transport #toolbar button.tool .ti { font-size: 13px; line-height: 1; opacity: 0.85; }
+      #transport #toolbar button.tool .tc { font-weight: 600; letter-spacing: 0.02em; }
+      #transport #toolbar button.tool.on {
+        color: var(--emerald);
+        border-color: var(--emerald);
+        background: #16221c;
+      }
+      #transport #toolbar button.tool.on .ti { opacity: 1; }
+      #transport .clock {
+        font-variant-numeric: tabular-nums;
+        font-size: 15px;
+        color: var(--dim);
+        min-width: 92px;
+      }
+      #transport .spacer { flex: 1; }
+      #gpu-status { color: var(--dim); font-size: 12px; }
+      #gpu-status.ok { color: var(--play); }
+      #gpu-status.err { color: #ff6b6b; }
+      #transport select {
+        background: #1b2029;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 5px 6px;
+        font-size: 12px;
+      }
+      #transport label { color: var(--dim); font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
+      #transport .fmt { color: var(--dim); font-size: 12px; }
+      #metrics {
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+        color: var(--dim);
+        white-space: nowrap;
+      }
+      #metrics .warn { color: #ffb454; }
+
+      /* ---- workspace: top / bottom / left / right placeholder panes around the
+             centre track area. Kept empty on purpose so future tools (mixer,
+             inspector, browser, timeline ruler) have a home. ---- */
+      /* Left pane runs the FULL window height (beside the ruler AND the mixer);
+         everything else stacks in the main column to its right. */
+      #workspace { flex: 1; display: flex; min-height: 0; }
+      #workspace-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+      #workspace-mid { flex: 1; display: flex; min-height: 0; }
+      .pane {
+        background: #0e1116;
+        color: var(--dim);
+        font-size: 11px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        user-select: none;
+      }
+      /* ---- top pane = time ruler + live timecode readout in the left gutter ---- */
+      #pane-top {
+        height: 34px;
+        border-bottom: 1px solid var(--line);
+        position: relative;
+        background: #0e1116;
+        user-select: none;
+      }
+      #ruler-canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        cursor: text;
+      }
+      #ruler-tc {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: var(--lane-left);
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.02em;
+        color: var(--emerald);
+        pointer-events: none;
+        z-index: 1;
+      }
+
+      /* ---- left pane = selected-track detail (fader / EQ / comp / saturation / inserts) ---- */
+      #pane-left {
+        width: var(--pane-side);
+        flex: none;
+        border-right: 1px solid var(--line);
+        display: block;
+        align-items: stretch;
+        justify-content: flex-start;
+        text-transform: none;
+        letter-spacing: normal;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+      #track-detail { display: flex; flex-direction: column; min-height: 100%; }
+      #track-detail .td-empty { margin: auto; color: var(--dim); font-size: 11px; }
+      #td-head {
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        gap: 6px;
+        align-items: baseline;
+        position: sticky;
+        top: 0;
+        background: #0e1116;
+        z-index: 1;
+      }
+      #td-head .n { flex: none; color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+      #td-head .t {
+        min-width: 0;
+        color: var(--text);
+        font-weight: 600;
+        font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .td-section { border-bottom: 1px solid var(--line); padding: 10px; }
+      /* channel-strip section with its effect engaged: lift the panel a touch */
+      .td-section.fx-on { background: #16202c; box-shadow: inset 2px 0 0 rgba(77, 163, 255, 0.45); }
+      .td-section > h4 {
+        margin: 0 0 8px;
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--dim);
+        font-weight: 600;
+      }
+      .td-row { display: flex; align-items: center; gap: 8px; }
+      .td-section.td-channel { display: flex; flex-direction: column; }
+      #td-fader-mid {
+        position: relative;
+        display: flex;
+        gap: 6px;
+        height: 464px;
+        justify-content: center;
+        align-items: stretch;
+      }
+      /* column beside the fader: pan knob on top, Mute / Solo stacked below */
+      .td-fader-side {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        padding-bottom: 8px;
+        margin-left: 26px;
+      }
+      .td-db { margin-top: 6px; text-align: center; font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+      .td-btns { display: flex; gap: 6px; margin-top: 8px; }
+      .td-btns.td-btns-vert { flex-direction: column; width: 56px; margin-top: 0; }
+      .td-btns button {
+        flex: 1;
+        padding: 5px 0;
+        border-radius: 3px;
+        background: #1b2029;
+        color: var(--dim);
+        border: 1px solid var(--line);
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .td-btns.td-btns-vert button { padding: 9px 0; }
+      /* bordered Input box (Trim / HPF) in the fader-side column */
+      .td-in-box {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px 10px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #12161d;
+        margin-bottom: auto; /* pin Input to the top; Pan + Mute/Solo stay at the bottom */
+      }
+      .td-in-cap {
+        font-size: 8px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--dim);
+      }
+      .td-btns button.on.m { color: var(--warn); border-color: var(--warn); }
+      .td-btns button.on.s { color: var(--play); border-color: var(--play); }
+      .td-btns button.on.r { color: var(--rec); border-color: var(--rec); }
+      /* saturation drive/color mode picker: selected mode filled with accent */
+      .td-btns button.sat-mode.on { background: var(--accent); color: #06101c; border-color: var(--accent); }
+
+      /* detail-pane controls: sliders / checks / knobs / EQ bands / insert rack */
+      .td-row > input[type='range'] { accent-color: var(--accent); height: 16px; }
+      .td-check {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10px;
+        color: var(--dim);
+        margin-bottom: 6px;
+        cursor: pointer;
+      }
+      .td-check input { accent-color: var(--accent); }
+      .eq-band {
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 6px;
+        margin-bottom: 6px;
+      }
+      .eq-band-h { font-size: 10px; font-weight: 700; color: var(--text); letter-spacing: 0.1em; margin-bottom: 4px; }
+      .knob-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 4px 0; }
+      .knob {
+        width: 46px;
+        height: 46px;
+        border-radius: 50%;
+        background: radial-gradient(circle at 50% 32%, #4c5568, #262d3a);
+        border: 1px solid #59647a;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+        position: relative;
+        cursor: ns-resize;
+        touch-action: none;
+        /* 20% smaller visually; the 46px box is kept as a comfortable drag target */
+        transform: scale(0.8);
+        margin: -4px -5px;
+      }
+      .knob > i {
+        position: absolute;
+        left: 50%;
+        top: 3px;
+        width: 2px;
+        height: 16px;
+        margin-left: -1px;
+        background: var(--accent);
+        border-radius: 1px;
+        transform-origin: 50% 20px;
+      }
+      /* scale ticks around the 270° arc (placed by JS via inline rotate) */
+      .knob > b {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 2px;
+        height: 4px;
+        margin: -2px 0 0 -1px;
+        background: #7a8397;
+        border-radius: 1px;
+        transform-origin: 50% 50%;
+      }
+      .knob > b.major { height: 7px; background: #c4ccd8; }
+      .knob-val { font-size: 10px; color: var(--text); font-variant-numeric: tabular-nums; }
+      .knob-label { font-size: 9px; letter-spacing: 0.04em; color: #98a1b2; text-transform: uppercase; }
+      .knob-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px 12px;
+        justify-content: center;
+        margin-top: 4px;
+      }
+      .knob-grid .knob-cell { padding: 0; width: 58px; }
+      .strip.master.selected { box-shadow: inset 0 3px 0 var(--accent); }
+
+      .lane-left, .lane-right { cursor: pointer; }
+      .lane.selected { background: rgba(77, 163, 255, 0.20); box-shadow: inset 0 0 0 1px var(--accent); }
+      .lane.selected .lane-left { box-shadow: inset 4px 0 0 var(--accent); background: #24384f; }
+      .lane.selected .lane-title { color: var(--accent); }
+      .lane.selected .lane-right { background: #24384f; }
+      /* track has its built-in saturation stage engaged */
+      .lane.sat-active .lane-left { background: #241d17; }
+      .lane.sat-active.selected .lane-left { background: #3a3350; }
+
+      /* ---- bottom pane = channel strips + a fixed master strip on the right ---- */
+      #pane-bottom {
+        height: var(--pane-vert);
+        border-top: 1px solid var(--line);
+        align-items: stretch;
+        justify-content: flex-start;
+        text-transform: none;
+        letter-spacing: normal;
+        padding: 0;
+        overflow: hidden;
+      }
+      #strips-scroll { flex: 1; min-width: 0; min-height: 0; overflow-x: auto; overflow-y: hidden; }
+      #strips { display: flex; align-items: stretch; min-width: min-content; height: 100%; }
+      #strips:empty::after {
+        content: 'mixer — add a track';
+        align-self: center;
+        padding: 0 16px;
+        color: var(--dim);
+      }
+      .strip {
+        width: 90px;
+        height: 100%;
+        flex: none;
+        border-right: 1px solid var(--line);
+        padding: 6px 4px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        background: var(--panel);
+        overflow: hidden;
+      }
+      /* selected track: lift the whole strip a touch, tint the fader area, accent the name */
+      .strip.selected { background: #1a2231; }
+      .strip.selected .strip-mid { background: rgba(77, 163, 255, 0.13); border-radius: 4px; }
+      .strip.selected .strip-head .t { color: var(--accent); }
+      .strip-head { display: flex; gap: 4px; align-items: baseline; font-size: 12px; flex: none; }
+      .strip-head .n { flex: none; color: var(--dim); font-variant-numeric: tabular-nums; }
+      .strip-head .t {
+        min-width: 0;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      /* Cubase-style insert rack: a fixed column of slots. Each slot picks one
+         plugin (Reverb / Delay / 5-band EQ) via a pop menu; order = signal chain.
+         The built-in channel strip is NOT here — it is part of the track. */
+      .strip-rack {
+        flex: none;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        padding: 1px;
+        border: 1px solid #333b4b;
+        border-radius: 3px;
+        background: #1a1f29;
+      }
+      .strip-slot {
+        height: 22px;
+        display: flex;
+        align-items: center;
+        gap: 0;
+        padding: 0 1px;
+        font-size: 12px;
+        border-radius: 2px;
+        background: #222735;
+        color: #9aa3b4;
+        cursor: pointer;
+        overflow: hidden;
+      }
+      .strip-slot.filled { background: #26374b; color: var(--text); }
+      .strip-slot .slot-num {
+        flex: none;
+        width: 12px;
+        text-align: center;
+        opacity: 0.65;
+        font-variant-numeric: tabular-nums;
+      }
+      .strip-slot .slot-add { flex: 1; text-align: center; opacity: 0.55; font-size: 14px; }
+      .strip-slot:hover .slot-add { opacity: 0.95; color: var(--accent); }
+      .strip-slot .slot-name {
+        flex: 1;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .strip-slot .slot-byp,
+      .strip-slot .slot-caret {
+        flex: none;
+        width: 18px;
+        height: 19px;
+        padding: 0;
+        font-size: 12px;
+        line-height: 1;
+        border: 0;
+        border-radius: 2px;
+        background: transparent;
+        color: var(--dim);
+        cursor: pointer;
+      }
+      .strip-slot .slot-byp.on { color: var(--warn); }
+      .strip-slot .slot-caret:hover { color: var(--accent); }
+
+      /* plugin pick / replace pop menu (positioned in JS, click-away closes) */
+      .fx-menu {
+        position: fixed;
+        z-index: 20;
+        min-width: 124px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 4px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+      }
+      .fx-menu button {
+        text-align: left;
+        padding: 6px 10px;
+        font-size: 12px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--text);
+        cursor: pointer;
+      }
+      .fx-menu button:hover { background: #1b2029; }
+      .fx-menu button.rm { color: var(--rec); }
+      .fx-menu-sep { height: 1px; margin: 2px 0; background: var(--line); }
+
+      /* ---- floating plugin windows (Pro Tools style) --------------------------
+         One un-pinned window is kept at a time — opening another replaces it.
+         Pin (📌) a window and it stays; further un-pinned opens replace only
+         each other. Non-modal: the mixer / tracks stay live underneath. ---- */
+      .plug-win {
+        position: fixed;
+        width: 404px;
+        background: #1c212b;
+        border: 1px solid #333b4b;
+        border-radius: 8px;
+        box-shadow: 0 20px 52px rgba(0, 0, 0, 0.55);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        user-select: none;
+      }
+      .plug-win.pinned { border-color: var(--accent); }
+      .plug-win-bar {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        padding: 8px 10px;
+        background: #313847;
+        border-bottom: 1px solid #3d4557;
+        cursor: move;
+      }
+      .plug-win-bar .pw-name {
+        font-size: 12px;
+        font-weight: 600;
+        color: #eef1f6;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .plug-win-bar .pw-spacer { flex: 1; }
+      .plug-win-bar button {
+        flex: none;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        font-size: 11px;
+        line-height: 1;
+        border-radius: 3px;
+        background: #1a1f28;
+        color: var(--text);
+        border: 1px solid #454e61;
+        cursor: pointer;
+      }
+      .plug-win-bar .pw-byp.on { color: var(--warn); border-color: var(--warn); }
+      .plug-win-bar .pw-pin.on { color: var(--accent); border-color: var(--accent); }
+      .plug-win-bar .pw-close:hover { color: var(--rec); border-color: var(--rec); }
+      /* Cubase-style layered inset: window chrome → margin → dark control panel
+         → generous inner padding before the controls. */
+      .plug-win-body { padding: 14px; background: #161b23; }
+      .plug-panel {
+        background: #10141b;
+        border: 1px solid #333b4b;
+        border-radius: 8px;
+        padding: 30px 28px;
+        min-height: 150px;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+      }
+      /* Reverb / Delay: sparse layout, ~2× the panel height */
+      .plug-panel.plug-panel-tall {
+        min-height: 300px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+      .plug-panel .knob-grid { margin-top: 0; gap: 26px 22px; }
+      .plug-panel .eq-band { border-color: #3d4557; margin-bottom: 12px; }
+      .plug-panel .eq-band:last-child { margin-bottom: 0; }
+      .plug-panel .eq-band-h { color: #eef1f6; }
+      .plug-panel .td-check { color: #c4ccd8; justify-content: center; margin: 14px 0 0; }
+      .plug-panel .td-check input { accent-color: var(--accent); }
+
+      /* left-pane insert-slot rack: same slots as the mixer strip, roomier */
+      #pane-left .strip-rack { padding: 3px; gap: 2px; }
+      #pane-left .strip-slot { height: 20px; font-size: 12px; padding: 0 6px; gap: 5px; }
+      #pane-left .strip-slot .slot-num { width: 12px; }
+      /* "Inserts" heading turns accent when the track has at least one insert */
+      .td-section.has-fx > h4 { color: var(--accent); }
+      /* Mixer fader row — three side-by-side columns, no overlap / no z-index games:
+         [ dB gauge ][ rail + cap ][ VU ] … then free space on the right for a
+         future gain-reduction meter. All columns are the same height, so the
+         cap and the gauge ticks share one vertical mapping (`faderTop`). */
+      .strip-mid {
+        position: relative;
+        flex: 1 1 40px;
+        min-height: 40px;
+        display: flex;
+        gap: 3px;
+        align-items: stretch;
+        justify-content: flex-start;
+        padding-left: 2px;
+      }
+      /* column 1: the dB reference gauge, its own box left of the rail so the
+         cap can never cover it. Numbers hug the right edge (rail side). */
+      .fader-scale {
+        position: relative;
+        width: 22px;
+        flex: none;
+        pointer-events: none;
+      }
+      .fader-scale > b {
+        position: absolute;
+        right: 8px; /* leave room for the tick between number and rail */
+        transform: translateY(-50%);
+        text-align: right;
+        font-size: 8px;
+        font-weight: 400;
+        color: var(--dim);
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+      .fader-scale > b::after {
+        /* tick, pointing right toward the rail */
+        content: '';
+        position: absolute;
+        left: 100%;
+        margin-left: 2px;
+        top: 50%;
+        width: 4px;
+        height: 1px;
+        background: var(--line);
+      }
+      .fader-scale > b.major::after { width: 6px; background: var(--dim); }
+      /* column 2: the rail (::before, centred) + the invisible <input> + the cap */
+      .fader-wrap { position: relative; width: 28px; flex: none; }
+      .fader-wrap::before {
+        content: '';
+        position: absolute;
+        left: 50%;
+        margin-left: -1px;
+        top: 25px; /* half the cap height — keeps rail == cap travel */
+        bottom: 25px;
+        width: 2px;
+        border-radius: 1px;
+        background: var(--line);
+        z-index: 0;
+      }
+      .strip-fader {
+        -webkit-appearance: none;
+        appearance: none;
+        position: relative;
+        z-index: 1; /* the invisible drag target */
+        writing-mode: vertical-lr;
+        direction: rtl; /* up = louder */
+        width: 28px;
+        height: 100%;
+        margin: 0;
+        background: transparent;
+        cursor: pointer;
+      }
+      .strip-fader::-webkit-slider-runnable-track {
+        width: 2px;
+        background: transparent; /* visible rail is .fader-wrap::before */
+      }
+      .strip-fader::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 28px;
+        height: 40px;
+        border: 0;
+        background: transparent; /* visible cap is .fader-cap, placed by JS */
+      }
+      /* the visible fader cap — a plain div (no webkit slider quirks), centred on
+         the rail; `top` is set by JS via `faderTop` (same mapping as the ticks). */
+      .fader-cap {
+        position: absolute;
+        left: 50%;
+        margin-left: -12.5px; /* half of width */
+        width: 25px;
+        height: 50px;
+        transform: translateY(-50%); /* `top` (from faderTop) marks the cap centre — same as a tick */
+        z-index: 2;
+        pointer-events: none;
+        background: url('/feder.png') center / 25px 50px no-repeat;
+      }
+      /* .strip-vu sits right after the fader; the right edge stays free for a
+         gain-reduction meter later (no margin-left:auto). */
+      .strip-vu {
+        width: 11px;
+        border: 1px solid var(--line);
+        border-radius: 2px;
+        position: relative;
+        overflow: hidden;
+        /* Fixed scale: only the tip that pokes into a zone shows its colour. */
+        background: linear-gradient(
+          to top,
+          #1f9d63 0%, #1f9d63 78%,
+          var(--warn) 82%, var(--warn) 88%,
+          #f0912e 91%, #f0912e 97%,
+          var(--rec) 99%
+        );
+      }
+      .strip-vu > i {
+        /* dark cover from the top; JS shrinks it as the level rises */
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        height: 100%;
+        background: #05140f;
+      }
+      .strip-nums { display: flex; gap: 4px; flex: none; }
+      .strip-db {
+        flex: 1;
+        min-width: 0;
+        font-size: 13px;
+        color: var(--dim);
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+      .strip-peak {
+        flex: 1;
+        min-width: 0;
+        font-size: 13px;
+        color: var(--dim);
+        font-variant-numeric: tabular-nums;
+        cursor: pointer;
+        text-align: center;
+        padding: 1px 0;
+        border-radius: 2px;
+        background: #05140f;
+      }
+      .strip-peak.over { color: var(--rec); font-weight: 700; }
+      /* master strip: Short-term LUFS under the dB / peak numbers */
+      .strip-lufs {
+        flex: none;
+        font-size: 11px;
+        color: var(--dim);
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+        padding: 1px 0;
+      }
+      .strip-lufs::before { content: '≈LUFS '; font-size: 8px; opacity: 0.6; }
+      /* Maximizer window LUFS readout */
+      .lufs-title {
+        margin-top: 14px;
+        font-size: 10px;
+        letter-spacing: 0.14em;
+        color: #98a1b2;
+        text-transform: uppercase;
+      }
+      .lufs-approx { color: var(--warn); letter-spacing: 0.06em; cursor: help; }
+      .lufs-meter {
+        margin-top: 6px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 10px 12px;
+        border: 1px solid #3d4557;
+        border-radius: 4px;
+        background: #10141b;
+      }
+      .lufs-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+      .ll-lab { font-size: 11px; color: #98a1b2; letter-spacing: 0.04em; }
+      .ll-val {
+        font-size: 15px;
+        color: #eef1f6;
+        font-variant-numeric: tabular-nums;
+      }
+      .lufs-row.lufs-strong .ll-val { color: var(--accent); font-weight: 700; }
+      .strip-knob {
+        width: 26px;
+        height: 26px;
+        justify-self: center;
+        align-self: center;
+        border-radius: 50%;
+        background: #1b2029;
+        border: 1px solid var(--line);
+        position: relative;
+        cursor: ns-resize;
+        touch-action: none;
+      }
+      .strip-knob > i {
+        position: absolute;
+        left: 50%;
+        top: 2px;
+        width: 2px;
+        height: 9px;
+        margin-left: -1px;
+        background: var(--accent);
+        transform-origin: 50% 11px;
+      }
+      /* 2 columns: M S on the first row, R on the second (bottom-left). Square cells. */
+      .strip-btns {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+        flex: none;
+        width: 76%; /* M/S/R buttons ~10% smaller again */
+        margin: 0 auto;
+      }
+      .strip-btns button {
+        aspect-ratio: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 0;
+        border-radius: 3px;
+        background: #1b2029;
+        color: var(--dim);
+        border: 1px solid var(--line);
+        cursor: pointer;
+      }
+      .strip-btns button.on.m { color: var(--warn); border-color: var(--warn); }
+      .strip-btns button.on.s { color: var(--play); border-color: var(--play); }
+      .strip-btns button.on.r { color: var(--rec); border-color: var(--rec); }
+
+      /* ---- master strip: identical shape / fader to a channel strip, pinned
+             right. Only the "MASTER" label is tinted; rail, cap, range and
+             travel all match a channel fader. ---- */
+      .strip.master {
+        border-right: 0;
+        background: #1a1417;
+      }
+      .strip.master .strip-head .t { color: var(--rec); letter-spacing: 0.14em; }
+      #master-val {
+        flex: none;
+        /* reserve the same height as a channel strip's .strip-btns (2 rows of
+           ~29px + 4px gap) so .strip-mid — and the fader travel — line up 1:1 */
+        min-height: 62px;
+        padding-top: 3px;
+        font-size: 12px;
+        color: var(--dim);
+        font-variant-numeric: tabular-nums;
+        text-align: center;
+      }
+
+      /* ---- centre: scrollable list of track lanes ---- */
+      #tracks-scroll {
+        flex: 1;
+        min-width: 0;
+        position: relative;
+        overflow-y: auto;
+        overflow-x: hidden;
+        background: var(--bg);
+      }
+      #tracks { position: relative; min-height: 100%; }
+      .lane {
+        display: flex;
+        height: var(--lane-h);
+        border-bottom: 1px solid var(--line);
+      }
+      .lane-left {
+        width: var(--lane-left);
+        flex: none;
+        padding: 3px 8px;
+        border-right: 1px solid var(--line);
+        background: var(--panel);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 1px;
+        overflow: hidden;
+      }
+      .lane-name { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+      .lane-num {
+        flex: none;
+        color: var(--dim);
+        font-size: 10px;
+        font-variant-numeric: tabular-nums;
+      }
+      .lane-title {
+        min-width: 0;
+        color: var(--text);
+        font-weight: 600;
+        font-size: 11px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .lane-sub { color: var(--dim); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .lane-center {
+        flex: 1;
+        min-width: 0;
+        position: relative;
+        background: var(--emerald-bar);
+      }
+      .lane-center canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+      /* clip-chrome overlay (borders / selection / fade curves / handles) sits
+         above the waveform; pointer events are handled on .lane-center itself. */
+      .lane-center canvas.lane-fx { pointer-events: none; z-index: 1; }
+      #tracks[data-tool='split'] .lane-center { cursor: col-resize; }
+      #tracks[data-tool='erase'] .lane-center { cursor: not-allowed; }
+      #tracks[data-tool='range'] .lane-center { cursor: crosshair; }
+      .lane-right {
+        width: var(--lane-right);
+        flex: none;
+        border-left: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      /* ---- right pane = audio (source + clip) list ---- */
+      #pane-right {
+        width: var(--pane-right-w, 224px);
+        flex: none;
+        border-left: 1px solid var(--line);
+        background: #0e1116;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+      }
+      #pane-right .pr-head {
+        flex: none;
+        padding: 6px 10px;
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--dim);
+        border-bottom: 1px solid var(--line);
+      }
+      #audio-list { flex: 1; overflow-y: auto; padding: 0 0 12px; }
+      .al-section { padding: 0 0 4px; }
+      .al-section + .al-section { border-top: 1px solid var(--line); margin-top: 4px; }
+      .al-section h4 {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        margin: 0;
+        padding: 6px 10px 4px;
+        background: #0e1116;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--dim);
+      }
+      .al-row {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        padding: 4px 10px;
+        cursor: grab;
+        border-left: 2px solid transparent;
+      }
+      .al-row:hover { background: #1a1f29; border-left-color: var(--accent); }
+      .al-row.sel { background: #1d2b24; border-left-color: var(--accent); }
+      .al-row.sel .al-name { color: #7ff0c4; }
+      .al-row:active { cursor: grabbing; }
+      .al-name {
+        font-size: 11px;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .al-meta { font-size: 9px; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+      /* time grid: vertical lines over the waveform column, aligned with the top
+         ruler's major ticks. Drawn ABOVE the lane canvases (grey), the playhead
+         sits above the grid. */
+      #grid {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        z-index: 4;
+        overflow: hidden;
+      }
+      #grid > i {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 1px;
+        background: rgba(155, 164, 178, 0.16);
+      }
+      #grid > i.major { background: rgba(155, 164, 178, 0.32); }
+      #playhead {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 1px;
+        height: 100%;
+        background: var(--emerald);
+        pointer-events: none;
+        opacity: 0;
+        z-index: 5;
+      }
+      #hint {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        color: var(--dim);
+        text-align: center;
+        pointer-events: none;
+      }
+
+      /* ---- add-track wizard ---- */
+      #wizard {
+        position: fixed;
+        inset: 0;
+        background: rgba(4, 6, 10, 0.66);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+      }
+      /* `display: flex` above outranks the UA [hidden] rule — restore it. */
+      #wizard[hidden] { display: none; }
+      .wizard-card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 22px 24px;
+        width: 340px;
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+      }
+      .wizard-card h2 { margin: 0 0 4px; font-size: 15px; }
+      .wizard-card p { margin: 0 0 16px; color: var(--dim); font-size: 12px; }
+      .wizard-actions { display: flex; flex-direction: column; gap: 8px; }
+      .wizard-card button {
+        background: #1b2029;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 9px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        text-align: left;
+      }
+      .wizard-card button:hover { border-color: var(--emerald); }
+      #wiz-cancel {
+        margin-top: 14px;
+        text-align: center;
+        color: var(--dim);
+      }
+      #wiz-cancel:hover { border-color: var(--line); color: var(--text); }
+    </style>
+  </head>
+  <body>
+    <div id="transport">
+      <button id="play">▶ Play</button>
+      <button id="rec" title="Record armed tracks from the playhead; Stop commits the takes">● Rec</button>
+      <button id="stop">■ Stop</button>
+      <span class="clock" id="clock">0:00.000</span>
+      <span id="toolbar">
+        <button data-tool="select" class="tool on" title="Select — move / trim edges / fade corners  (1)">
+          <span class="ti">⬍</span><span class="tc">Select</span>
+        </button>
+        <button data-tool="split" class="tool" title="Split — click a clip to cut it at that point  (2)">
+          <span class="ti">✂</span><span class="tc">Split</span>
+        </button>
+        <button data-tool="range" class="tool" title="Range — drag to mark a time span (no edit; use Edit menu / Ctrl+X…)  (3)">
+          <span class="ti">▨</span><span class="tc">Range</span>
+        </button>
+      </span>
+      <button id="add-track">＋ Add Track</button>
+      <button id="proj-save" title="Save project (Ctrl+S)">💾 Save</button>
+      <button id="proj-saveas" title="Save project to a file…">Save As…</button>
+      <button id="proj-open" title="Open a project file…">📂 Open</button>
+      <label>Project
+        <select id="sr" title="192 kHz keeps 2× the audio in VRAM per track — for big-VRAM GPUs / few tracks">
+          <option value="44100">44.1k</option>
+          <option value="48000">48k</option>
+          <option value="96000" selected>96k</option>
+          <option value="192000">192k</option>
+        </select>
+        <span class="fmt">· 32f</span>
+      </label>
+      <span id="metrics"></span>
+      <span class="spacer"></span>
+      <span id="gpu-status">initializing WebGPU…</span>
+    </div>
+
+    <div id="workspace">
+      <div id="pane-left" class="pane">
+        <div id="track-detail"><div class="td-empty">select a track</div></div>
+      </div>
+      <div id="workspace-main">
+        <div id="pane-top">
+          <canvas id="ruler-canvas"></canvas>
+          <span id="ruler-tc">0:00.000</span>
+        </div>
+        <div id="workspace-mid">
+          <div id="tracks-scroll">
+            <div id="tracks"><div id="grid"></div><div id="playhead"></div></div>
+            <div id="hint">
+              No tracks yet.<br />
+              Press <b>＋ Add Track</b> to pick a WAV.
+            </div>
+          </div>
+          <div id="pane-right">
+            <div class="pr-head">Audio</div>
+            <div id="audio-list"></div>
+          </div>
+        </div>
+        <div id="pane-bottom" class="pane">
+          <div id="strips-scroll"><div id="strips"></div></div>
+          <div class="strip master" id="master-strip">
+          <div class="strip-head"><span class="t">MASTER</span></div>
+          <div class="strip-rack" id="master-rack"></div>
+          <div class="strip-mid">
+            <div class="fader-wrap">
+              <input id="master" class="strip-fader" type="range" min="-60" max="6" step="0.5" value="-10" />
+            </div>
+            <div class="strip-vu"><i></i></div>
+          </div>
+          <div class="strip-nums">
+            <div class="strip-db" id="master-db" title="master level">−∞</div>
+            <div class="strip-peak" id="master-peak" title="peak — click to reset">−∞</div>
+          </div>
+          <div class="strip-lufs" id="master-lufs" title="short-term loudness — BS.1770 K-weighting + provisional +2 dB trim (almost, pending reference check)">−∞</div>
+          <div id="master-val">-10.0 dB</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="wizard" hidden>
+      <div class="wizard-card">
+        <h2>New track</h2>
+        <p>Pick one or more WAVs — one track per file, named from the filename.</p>
+        <div class="wizard-actions">
+          <button id="wiz-wav">Select WAV file(s)…</button>
+          <button id="wiz-tone">GPU demo tone</button>
+        </div>
+        <button id="wiz-cancel">Cancel</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
