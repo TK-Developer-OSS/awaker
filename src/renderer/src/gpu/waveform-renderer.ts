@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -21,7 +21,7 @@ export interface PeakClip {
   highlight?: boolean
 }
 
-const VIEW_UBO_SIZE = 32 // 2×u32 + 4×f32 + 2×f32 clip-edge px, padded
+const VIEW_UBO_SIZE = 64 // 2×u32 + 4×f32 + 2×f32 clip-edge px, then wave + fill colours (2×vec4)
 
 /** Draws a lane's clips straight from their sources' GPU peak buffers. */
 export class WaveformRenderer {
@@ -63,6 +63,17 @@ export class WaveformRenderer {
     })
   }
 
+  private bg: [number, number, number] = [0.016, 0.137, 0.106]
+  private wave: [number, number, number] = [0.15, 0.165, 0.19]
+  private fill: [number, number, number] = [0.6, 0.9, 0.78]
+
+  /** Lane background, waveform ink and picked-clip fill (each r, g, b in 0..1). */
+  setColors(bg: [number, number, number], wave: [number, number, number], fill: [number, number, number]): void {
+    this.bg = bg
+    this.wave = wave
+    this.fill = fill
+  }
+
   resize(): void {
     const w = Math.max(1, Math.floor(this.canvas.clientWidth * this.dpr))
     const h = Math.max(1, Math.floor(this.canvas.clientHeight * this.dpr))
@@ -96,8 +107,8 @@ export class WaveformRenderer {
       colorAttachments: [
         {
           view: this.ctx.getCurrentTexture().createView(),
-          // Darker emerald lane background; the wave shader draws a brighter shade.
-          clearValue: { r: 0.016, g: 0.137, b: 0.106, a: 1 },
+          // The lane is painted in the track colour; the wave shader draws its dark-grey ink on top.
+          clearValue: { r: this.bg[0], g: this.bg[1], b: this.bg[2], a: 1 },
           loadOp: 'clear',
           storeOp: 'store'
         }
@@ -130,6 +141,7 @@ export class WaveformRenderer {
       new Uint32Array(params, 0, 2).set([clip.peakCount, firstBucket])
       new Float32Array(params, 8, 5).set([peaksPerPixel, cssW, pxOffset, picked, clipLeftPx])
       new Float32Array(params, 28, 1).set([clipRightPx])
+      new Float32Array(params, 32, 8).set([this.wave[0], this.wave[1], this.wave[2], 1, this.fill[0], this.fill[1], this.fill[2], 1])
       device.queue.writeBuffer(buf, 0, params)
 
       const bind = device.createBindGroup({

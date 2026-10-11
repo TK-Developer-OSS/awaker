@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -6,9 +6,14 @@ import { initGpu } from './gpu/device'
 import { GpuTrack } from './gpu/track'
 import { WaveformRenderer, type PeakClip } from './gpu/waveform-renderer'
 import { PlaybackScheduler } from './audio/scheduler'
+import { LiveBus, type LiveLane } from './audio/live-bus'
+import { initOptions } from './ui/options'
+import { initAddTrack } from './ui/add-track'
+import { fmtFaderDb } from './ui/fader-text'
+import { ensureMcpLamp } from './ui/mcp-guard'
 import type { Take } from './audio/recorder'
 import { registerMcpTools, type McpLane } from './mcp-tools'
-import type { MixSource, LaneClip } from './gpu/master-bus'
+import type { MixGroup, MixSource, LaneClip } from './gpu/master-bus'
 import { ChannelStrip, defaultStripParams } from './gpu/channel-strip'
 import {
   type AudioSource,
@@ -44,7 +49,49 @@ import {
 import { AwakerInsert } from './gpu/effects/awaker'
 import { BusCompInsert, BUSCOMP_RATIOS, BUSCOMP_ATTACKS_MS, BUSCOMP_RELEASES_MS } from './gpu/effects/buscomp'
 import { MaximizerInsert } from './gpu/effects/maximizer'
-import { decodeWav } from './wav'
+import { McuSurface } from './control/mcu'
+import { decodeWav, encodeWavFloat32, encodeWavPcm } from './wav'
+import { moveSlot } from './audio/slot-move'
+import { cleanStemName, groupStems, nullTest, resampleInterleaved, sanitizeStemExport, stemFileName, type StemExportSettings, type StemGroup } from './audio/stem-export'
+import { getStemDefaults } from './ui/export-options'
+import { SpectrumAccumulator, buildReport, type BucketLevels } from './audio/spectrum'
+import { getMixTarget } from './audio/mix-target'
+import { LevelMeter, suggestTrimDb } from './audio/levels'
+import { askMixdownFormat } from './ui/mixdown-dialog'
+import { TRACK_PALETTE, alignStemColors, lanePaint, normalizeColor, paletteColor, pickUnusedColor, pruneStemColors } from './ui/track-color'
+import { parseDawproject } from './project/dawproject-import'
+import {
+  buildDawprojectXml,
+  buildMetadataXml,
+  type ExpAudioSource,
+  type ExpTrack
+} from './project/dawproject-export'
+import {
+  midiTracks,
+  serializeMidi,
+  restoreMidi,
+  clearMidi,
+  addMidiTrack,
+  addMidiClip,
+  addNote,
+  onMidiChange,
+  beatsToFrames,
+  type MidiTrack,
+  type SzMidiTrack
+} from './midi/model'
+import { makeInstrument, listInstruments, instrumentLabel, normalizeInstrumentKind, type InstrumentNote } from './gpu/instrument'
+import { parseSmf, writeSmf } from './midi/smf'
+import { createPianoRoll, type PianoRollApi } from './midi/piano-roll'
+import { createStepGrid, type StepGridApi } from './midi/step-grid'
+import { PRESETS, presetNotes } from './midi/step-logic'
+import { DRUM_LANES, defaultDrumParams, type DrumParams } from './gpu/instruments/drums'
+import { fmPreset, type FmParams } from './gpu/instruments/fm'
+import { FM_PRESET_NAMES } from './gpu/instruments/fm-presets'
+// EarlySynth: the frozen, independent copy of the first FM synth (own code, own shader)
+import { earlyPreset } from './gpu/instruments/earlysynth/earlysynth'
+import { EARLY_PRESET_NAMES } from './gpu/instruments/earlysynth/presets'
+import { MidiIo } from './midi/io'
+import { defaultSynthParams, type SynthParams, type SynthWave } from './gpu/instruments/synth'
 import { state, update, subscribe, type DawState } from './state'
 
 // Route otherwise-swallowed failures (e.g. `void scheduler.start()` rejecting on
@@ -56,7 +103,14 @@ window.addEventListener('unhandledrejection', (e) =>
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
 
 const gpuStatus = $('gpu-status')
+const gpuLamp = $('gpu-lamp')
+/** The GPU lamp: green when WebGPU is up, red when it failed or the render loop stopped; `title` has the details. */
+const setGpuLamp = (state: 'ok' | 'err', detail: string): void => {
+  gpuLamp.className = `lamp ${state}`
+  gpuLamp.title = detail
+}
 const clock = $('clock')
+const clockBars = $('clock-bars')
 const metricsEl = $('metrics')
 const hint = $('hint')
 const playBtn = $<HTMLButtonElement>('play')
@@ -93,7 +147,7 @@ interface LaneMix {
 
 interface Strip {
   el: HTMLElement
-  /** Cubase-style insert-slot rack container (8 slots). */
+  /** Classic insert-slot rack container (8 slots). */
   rackEl: HTMLElement
   fader: HTMLInputElement
   knobInd: HTMLElement // rotary pan indicator
@@ -135,12 +189,42 @@ interface Lane {
   vu: number
   /** Max post-fader linear level seen since last reset (peak-hold readout). */
   peakHold: number
+  /** Set on instrument lanes: the MIDI track that feeds a GPGPU instrument whose render is this lane's audio. */
+  inst?: { midiTrackId: number; sig: string; timer: number }
+  /** Set on line-input lanes: live input through this lane's strip + inserts (no clips). */
+  live?: { monitor: boolean }
+  /** Stem this track is exported with (tracks with the same name become one stem file). '' / absent = none. */
+  stem?: string
+  /** Group channel this track's output goes to (absent = straight to the master). */
+  group?: number
+  /** Track colour `#rrggbb`: the lane is painted with it, the waveform is dark grey on top. */
+  color?: string
 }
 
 const dbToLin = (db: number): number => (db <= -60 ? 0 : Math.pow(10, db / 20))
 const linToDb = (x: number): number => (x <= 1e-4 ? -Infinity : 20 * Math.log10(x))
 const fmtLufs = (v: number): string => (!Number.isFinite(v) || v <= -70 ? '−∞' : v.toFixed(1))
 const lanes: Lane[] = []
+
+/**
+ * Group channels (buses): the tracks routed to one are summed, run through the group's inserts, then its fader / pan
+ * on the way into the master. Group ids live above the track ids (1001, 1002, …) so a single number names either one
+ * (insert owners, selection, MCP).
+ */
+const GROUP_ID_BASE = 1000
+interface Group {
+  id: number
+  name: string
+  color: string
+  mix: LaneMix
+  inserts: Insert[]
+  peakHold: number
+  vu: number
+  strip: Strip
+}
+const groups: Group[] = []
+let nextGroupId = GROUP_ID_BASE + 1
+const groupById = (id: unknown): Group | undefined => groups.find((g) => g.id === id)
 let nextId = 1
 let meterTextAt = 0 // last time the strip dB / peak numbers were written
 let masterVu = 0
@@ -186,6 +270,18 @@ function fmtTime(frames: number): string {
   const m = Math.floor(s / 60)
   const r = s - m * 60
   return `${m}:${r.toFixed(3).padStart(6, '0')}`
+}
+
+/** Playhead as bar.beat.sixteenth in the project's time signature (1-based), for the transport bar. */
+function fmtBars(frames: number): string {
+  const quarters = (frames / state.sampleRate) * (state.bpm / 60)
+  const units = quarters * (state.timeSigDen / 4) // beats of the signature's own note value
+  const num = Math.max(1, state.timeSigNum)
+  const bar = Math.floor(units / num) + 1
+  const inBar = units - (bar - 1) * num
+  const beat = Math.floor(inBar)
+  const sub = Math.max(1, Math.round(16 / Math.max(1, state.timeSigDen))) // sixteenths per beat
+  return `${bar}.${beat + 1}.${Math.floor((inBar - beat) * sub) + 1}`
 }
 
 /** Usable width (CSS px) of the waveform column inside a lane. */
@@ -297,9 +393,12 @@ function syncGrid(): void {
   while (kids.length > xs.length) gridEl.removeChild(kids[kids.length - 1])
 }
 
+/** Control-surface feedback pump, bound in boot() (no-op until then). */
+let mcuTick: () => void = () => {}
+
 let anySolo = false
 function refreshSolo(): void {
-  anySolo = lanes.some((l) => l.mix.solo)
+  anySolo = lanes.some((l) => l.mix.solo) || groups.some((g) => g.mix.solo)
 }
 
 /**
@@ -357,9 +456,52 @@ function makeScale(min: number, max: number): HTMLElement {
 }
 
 /** Build the channel strip DOM in the mix pane and wire its controls. */
-function buildStrip(lane: Lane, id: number, title: string): Strip {
+/** The small colour picker that opens from a colour band: the 12 palette colours; closes on a pick / outside click / Esc. */
+function openColorPopover(anchor: HTMLElement, current: string, onPick: (color: string) => void): void {
+  document.getElementById('color-pop')?.remove()
+  const pop = document.createElement('div')
+  pop.id = 'color-pop'
+  const cur = normalizeColor(current)
+  for (const c of TRACK_PALETTE) {
+    const b = document.createElement('button')
+    b.style.background = c
+    b.title = c
+    if (c === cur) b.className = 'on'
+    b.addEventListener('click', () => {
+      onPick(c)
+      close()
+    })
+    pop.append(b)
+  }
+  document.body.appendChild(pop)
+  const r = anchor.getBoundingClientRect()
+  const w = pop.offsetWidth
+  const h = pop.offsetHeight
+  pop.style.left = `${Math.max(4, Math.min(innerWidth - w - 4, r.left + r.width / 2 - w / 2))}px`
+  pop.style.top = `${Math.max(4, r.top - h - 6)}px`
+  const onDoc = (e: Event): void => {
+    if (!pop.contains(e.target as Node)) close()
+  }
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.key === 'Escape') close()
+  }
+  function close(): void {
+    pop.remove()
+    document.removeEventListener('pointerdown', onDoc, true)
+    document.removeEventListener('keydown', onKey, true)
+  }
+  document.addEventListener('pointerdown', onDoc, true)
+  document.addEventListener('keydown', onKey, true)
+}
+
+function buildStrip(
+  lane: { id: number; mix: LaneMix; peakHold: number; inserts: Insert[] },
+  id: number,
+  title: string,
+  isGroup = false
+): Strip {
   const el = document.createElement('div')
-  el.className = 'strip'
+  el.className = isGroup ? 'strip group' : 'strip'
   el.innerHTML =
     `<div class="strip-head"><span class="n"></span><span class="t"></span></div>` +
     `<div class="strip-rack"></div>` +
@@ -367,12 +509,13 @@ function buildStrip(lane: Lane, id: number, title: string): Strip {
     `<div class="fader-wrap"><input class="strip-fader" type="range" min="-60" max="6" step="0.5" value="0" /></div>` +
     `<div class="strip-vu"><i></i></div></div>` +
     `<div class="strip-nums">` +
-    `<div class="strip-db" title="level">−∞</div>` +
+    `<div class="strip-db" title="fader (dB)">0.0</div>` +
     `<div class="strip-peak" title="peak — click to reset">−∞</div></div>` +
     `<div class="strip-btns">` +
     `<button class="m">M</button><button class="s">S</button>` +
     `<button class="r">R</button><div class="strip-knob" title="pan — drag, dbl-click = centre"><i></i></div>` +
-    `</div>`
+    `</div>` +
+    `<div class="strip-color" title="colour — click to change"></div>`
   ;(el.querySelector('.strip-head .n') as HTMLElement).textContent = String(id)
   const t = el.querySelector('.strip-head .t') as HTMLElement
   t.textContent = title
@@ -383,7 +526,10 @@ function buildStrip(lane: Lane, id: number, title: string): Strip {
   const cap = document.createElement('div')
   cap.className = 'fader-cap'
   faderWrap.appendChild(cap)
-  stripsEl.appendChild(el)
+  // track strips stay in front of the group strips (new tracks are inserted before the first group)
+  const firstGroupStrip = isGroup ? null : stripsEl.querySelector('.strip.group')
+  if (firstGroupStrip) stripsEl.insertBefore(el, firstGroupStrip)
+  else stripsEl.appendChild(el)
 
   const knob = el.querySelector('.strip-knob') as HTMLElement
   const knobInd = knob.querySelector('i') as HTMLElement
@@ -461,6 +607,25 @@ function buildStrip(lane: Lane, id: number, title: string): Strip {
   strip.m.addEventListener('click', () => toggle(strip.m, 'mute'))
   strip.s.addEventListener('click', () => toggle(strip.s, 'solo'))
   strip.r.addEventListener('click', () => toggle(strip.r, 'rec'))
+  // The colour band at the bottom: click it to pick the colour (a stem's tracks follow).
+  const band = el.querySelector('.strip-color') as HTMLElement
+  band.addEventListener('pointerdown', (e) => e.stopPropagation())
+  band.addEventListener('click', (e) => {
+    e.stopPropagation()
+    const g = groupById(id)
+    const l = lanes.find((x) => x.id === id)
+    const current = g ? g.color : (l?.color ?? TRACK_PALETTE[0])
+    openColorPopover(band, current, (c) => {
+      if (g) {
+        g.color = c
+        applyGroupColor(g)
+        for (const m of lanes) if (m.group === g.id) adoptGroupColor(m, g)
+      } else if (l) {
+        setLaneColor(l, c)
+      }
+      if (id === selectedId) renderDetail()
+    })
+  })
   // Touching anywhere on the strip selects the track (its controls still work).
   el.addEventListener('pointerdown', () => selectLane(id))
   fillRack(strip.rackEl, lane.inserts, id) // 8 empty insert slots
@@ -505,6 +670,8 @@ function addLane(title: string): Lane {
     peakHold: 0
   } as unknown as Lane
   lane.strip = buildStrip(lane, id, title)
+  lane.color = paletteColor(id - 1)
+  applyLaneColor(lane)
   lanes.push(lane)
   if (selectedId === null) selectLane(id) // first track added → open its detail
   return lane
@@ -560,6 +727,570 @@ function addClipToLane(lane: Lane, source: AudioSource, startFrame = 0, srcOffse
   lane.dirty = true
   renderAudioList()
   return clip
+}
+
+// ---- instrument lanes (MIDI track → GPGPU instrument → audio in VRAM) -------------
+
+const midiTrackById = (id: number): MidiTrack | undefined => midiTracks.find((t) => t.id === id)
+
+/** All of a MIDI track's notes as instrument notes in project frames (clips flattened). */
+function instrumentNotes(mt: MidiTrack): InstrumentNote[] {
+  const out: InstrumentNote[] = []
+  const { bpm, sampleRate: sr } = state
+  for (const c of mt.clips) {
+    for (const n of c.notes) {
+      const a = beatsToFrames(c.start + n.start, bpm, sr)
+      out.push({
+        startFrame: Math.round(a),
+        endFrame: Math.round(a + beatsToFrames(n.dur, bpm, sr)),
+        key: n.key,
+        vel: n.vel
+      })
+    }
+  }
+  return out
+}
+
+/**
+ * (Re)render an instrument lane's audio on the GPU into its source buffers. Skipped
+ * when nothing that affects the sound changed (notes, instrument params, tempo, rate).
+ */
+function renderInstrumentLane(lane: Lane, force = false): void {
+  if (!lane.inst) return
+  const mt = midiTrackById(lane.inst.midiTrackId)
+  const clip = lane.clips[0]
+  const src = clip && getSource(clip.sourceId)
+  if (!mt || !mt.instrument || !src) return
+  const notes = instrumentNotes(mt)
+  const sig = `${state.sampleRate}|${state.bpm}|${mt.instrument.kind}|${JSON.stringify(mt.instrument.params)}|${notes
+    .map((n) => `${n.startFrame},${n.endFrame},${n.key},${n.vel}`)
+    .join(';')}`
+  if (!force && sig === lane.inst.sig) return
+  const inst = makeInstrument(mt.instrument.kind, mt.instrument.params)
+  if (!inst) return
+  inst.render(notes, state.sampleRate, src.gpu)
+  lane.inst.sig = sig
+  clip.srcOffset = 0
+  clip.lengthFrames = src.gpu.totalFrames
+  clip.fadeIn = 0
+  clip.fadeOut = 0
+  lane.dirty = true
+  refreshTotals()
+}
+
+/** Debounced re-render (knob drags / many edits arrive in bursts). */
+function scheduleInstrumentRender(lane: Lane): void {
+  if (!lane.inst) return
+  clearTimeout(lane.inst.timer)
+  lane.inst.timer = window.setTimeout(() => renderInstrumentLane(lane), 150)
+}
+
+const midiIo = new MidiIo()
+let pianoRoll: PianoRollApi | null = null
+function openPianoRoll(mt: MidiTrack, clipIndex = 0): void {
+  if (!pianoRoll) pianoRoll = createPianoRoll(document.body)
+  pianoRoll.open(mt, clipIndex)
+}
+let stepGrid: StepGridApi | null = null
+/** Drum tracks open the step sequencer; everything else opens the piano roll. */
+function openTrackEditor(mt: MidiTrack): void {
+  if (mt.instrument?.kind === 'drums') {
+    if (!stepGrid) stepGrid = createStepGrid(document.body, { openPianoRoll: (t) => openPianoRoll(t) })
+    stepGrid.open(mt)
+  } else {
+    openPianoRoll(mt)
+  }
+}
+
+// ---- line-input lanes ----------------------------------------------------------------
+
+let schedulerRef: PlaybackScheduler | null = null
+let liveBusRef: LiveBus | null = null
+const LIVE_LAT_KEY = 'awaker.liveLatencyMs'
+const REC_OFF_KEY = 'awaker.recOffsetMs'
+const readNum = (k: string, d: number): number => {
+  try {
+    const v = Number(localStorage.getItem(k))
+    return Number.isFinite(v) && localStorage.getItem(k) !== null ? v : d
+  } catch {
+    return d
+  }
+}
+const writeNum = (k: string, v: number): void => {
+  try {
+    localStorage.setItem(k, String(v))
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+const liveSub = (l: Lane): string => `line · ${l.recIn.stereo ? `In ${l.recIn.ch + 1}-${l.recIn.ch + 2}` : `In ${l.recIn.ch + 1}`}${l.live?.monitor ? '' : ' · monitor off'}`
+
+/** A lane whose audio is live line input, run through the strip + inserts in real time. */
+function addLiveLane(name = 'Line In', ch = 0, stereo = false): Lane {
+  const lane = addLane(name)
+  lane.live = { monitor: true }
+  lane.recIn = { ch: Math.max(0, ch | 0), stereo }
+  lane.el.classList.add('line')
+  setLaneSub(lane, liveSub(lane))
+  renderAudioList()
+  if (selectedId === lane.id) renderDetail() // addLane selected it before `live` was set
+  return lane
+}
+
+/** The live lanes as the live bus sees them (mute / solo folded into the fader gain, like playback). */
+function liveLanes(): LiveLane[] {
+  return lanes
+    .filter((l) => l.live?.monitor)
+    .map((l) => {
+      const audible = !l.mix.mute && (!anySolo || l.mix.solo)
+      return {
+        id: l.id,
+        ch: l.recIn.ch,
+        stereo: l.recIn.stereo,
+        mix: { gain: audible ? dbToLin(l.mix.gainDb) : 0, pan: l.mix.pan },
+        strip: l.dsp,
+        inserts: l.inserts
+      }
+    })
+}
+
+/** Detail-pane controls for a line-input track: channel, monitor, and the timing of the live path. */
+function buildLiveSection(lane: Lane): HTMLElement {
+  const sec = section('Line input')
+  if (!lane.live) return sec
+  const rowCss = 'display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:11px;color:var(--dim)'
+  const inCss = 'flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 4px;font-size:11px'
+
+  const chRow = document.createElement('label')
+  chRow.style.cssText = rowCss
+  chRow.append('Input')
+  const sel = document.createElement('select')
+  sel.style.cssText = inCss
+  const add = (v: string, t: string): void => {
+    const o = document.createElement('option')
+    o.value = v
+    o.textContent = t
+    sel.appendChild(o)
+  }
+  for (let n = 0; n < 8; n++) add(`m${n}`, `In ${n + 1} (mono)`)
+  for (let n = 0; n < 8; n += 2) add(`s${n}`, `In ${n + 1}-${n + 2} (stereo)`)
+  sel.value = `${lane.recIn.stereo ? 's' : 'm'}${lane.recIn.ch}`
+  sel.addEventListener('change', () => {
+    lane.recIn = { ch: Number(sel.value.slice(1)), stereo: sel.value[0] === 's' }
+    setLaneSub(lane, liveSub(lane))
+  })
+  chRow.appendChild(sel)
+  sec.appendChild(chRow)
+
+  const mon = document.createElement('label')
+  mon.style.cssText = rowCss
+  const cb = document.createElement('input')
+  cb.type = 'checkbox'
+  cb.checked = lane.live.monitor
+  cb.addEventListener('change', () => {
+    if (lane.live) lane.live.monitor = cb.checked
+    setLaneSub(lane, liveSub(lane))
+  })
+  mon.append(cb, 'Monitor through strip + inserts')
+  sec.appendChild(mon)
+
+  const num = (label: string, title: string, get: () => number, set: (v: number) => void): HTMLElement => {
+    const row = document.createElement('label')
+    row.style.cssText = rowCss
+    row.title = title
+    row.append(label)
+    const i = document.createElement('input')
+    i.type = 'number'
+    i.step = '1'
+    i.value = String(get())
+    i.style.cssText = inCss
+    i.addEventListener('change', () => set(Number(i.value) || 0))
+    row.append(i, 'ms')
+    return row
+  }
+  sec.appendChild(
+    num('Live latency', 'Where the monitored sound lands relative to the input: GPU + IPC head-room. 0 = automatic (one block + 15 ms, widened by itself when blocks arrive late). Set a number to pin it.', () => liveBusRef?.latencyMs ?? 0, (v) => {
+      if (liveBusRef) liveBusRef.latencyMs = Math.max(0, Math.min(200, v))
+      writeNum(LIVE_LAT_KEY, v)
+    })
+  )
+  sec.appendChild(
+    num('Rec offset', 'Extra shift of recorded takes (positive = earlier), added to the device latency the driver reports. Calibrate with a loopback cable.', () => schedulerRef?.recOffsetMs ?? 0, (v) => {
+      if (schedulerRef) schedulerRef.recOffsetMs = Math.max(-200, Math.min(500, v))
+      writeNum(REC_OFF_KEY, v)
+    })
+  )
+
+  const stats = document.createElement('div')
+  stats.style.cssText = 'font-size:10px;color:var(--dim);line-height:1.5;font-family:monospace;white-space:pre-wrap'
+  sec.appendChild(stats)
+  const refresh = (): void => {
+    if (!stats.isConnected) return
+    const info = schedulerRef?.liveInfo()
+    if (!info || !info.active) {
+      stats.textContent = 'idle — press Monitor (toolbar), Play or Rec'
+    } else {
+      const m = info.main
+      const b = info.bus
+      stats.textContent =
+        `landing +${info.latencyMs.toFixed(1)} ms (${m?.deltaFrames ?? 0} fr)\n` +
+        `round trip ${m ? m.rttMeanMs.toFixed(1) : '-'} ms (max ${m ? m.rttMaxMs.toFixed(1) : '-'})\n` +
+        `GPU ${b ? b.procMeanMs.toFixed(1) : '-'} ms/block (max ${b ? b.procMaxMs.toFixed(1) : '-'})\n` +
+        `blocks ${m?.blocks ?? 0} · late ${m?.late ?? 0} · dropped ${b?.dropped ?? 0}`
+    }
+    window.setTimeout(refresh, 500)
+  }
+  window.setTimeout(refresh, 100)
+  return sec
+}
+
+/** A new FM-synth track (default preset: a punchy pluck). */
+function addFmTrack(kind: 'earlysynth' | 'fm' = 'earlysynth', name = kind === 'fm' ? 'FM Synth' : 'EarlySynth', presetName = 'Pop Pluck', bars = 4): Lane {
+  const mt = addMidiTrack(name)
+  const load = kind === 'fm' ? fmPreset : earlyPreset
+  mt.instrument = { kind, params: load(presetName) ?? load('Pop Pluck') ?? {} }
+  addMidiClip(mt, 0, bars * 4, name)
+  return addInstrumentLane(mt)
+}
+
+/** A new Simple Synth track (the instrument the lane falls back to). */
+function addSynthTrack(name = 'Simple Synth', bars = 4): Lane {
+  const mt = addMidiTrack(name)
+  mt.instrument = { kind: 'synth', params: defaultSynthParams() }
+  addMidiClip(mt, 0, bars * 4, name)
+  return addInstrumentLane(mt)
+}
+
+/** A new drum-machine track with a preset pattern (default: the basic beat, 2 bars). */
+function addDrumTrack(name = 'Drums', presetName = 'Basic beat', bars = 2): Lane {
+  const mt = addMidiTrack(name, 9) // MIDI channel 10, the General MIDI drum channel
+  mt.instrument = { kind: 'drums', params: defaultDrumParams() }
+  const clip = addMidiClip(mt, 0, bars * 4, name)
+  const preset = PRESETS.find((p) => p.name.toLowerCase() === presetName.toLowerCase()) ?? PRESETS[0]
+  for (const n of presetNotes(preset, DRUM_LANES, bars)) addNote(clip, n.start, n.dur, n.key, n.vel)
+  clip.length = bars * 4
+  return addInstrumentLane(mt)
+}
+
+/** Create the lane that plays `mt` through its instrument (default: the simple synth). */
+function addInstrumentLane(mt: MidiTrack): Lane {
+  if (!mt.instrument) mt.instrument = { kind: 'synth', params: defaultSynthParams() }
+  const lane = addLane(mt.name)
+  lane.inst = { midiTrackId: mt.id, sig: '', timer: 0 }
+  lane.el.classList.add('instrument')
+  lane.el.addEventListener('dblclick', () => openTrackEditor(mt))
+  const src = registerSource({ name: mt.name, path: null, kind: 'inst', gpu: new GpuTrack(), envelope: null })
+  const clip = makeClip({ sourceId: src.id, name: mt.name, lengthFrames: 256 })
+  retainSource(src.id)
+  lane.clips.push(clip)
+  renderInstrumentLane(lane, true)
+  setLaneSub(lane, `inst · ${instrumentLabel(mt.instrument.kind)}`)
+  renderAudioList()
+  if (selectedId === lane.id) renderDetail() // addLane selected it before `inst` was set
+  return lane
+}
+
+/**
+ * Replace a track's sound engine. The notes, the strip, the inserts and the fader stay; only the
+ * instrument changes. Params of the engine being left are kept for this session, so switching back
+ * brings the old sound back.
+ */
+function swapInstrument(lane: Lane, kind: string): void {
+  const mt = lane.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+  if (!mt || !mt.instrument || normalizeInstrumentKind(mt.instrument.kind) === kind) return
+  const stash = (mt.stash ??= {})
+  stash[normalizeInstrumentKind(mt.instrument.kind)] = mt.instrument.params
+  const fresh = stash[kind] ?? makeInstrument(kind)?.params
+  if (!fresh) return
+  mt.instrument = { kind, params: fresh }
+  setLaneSub(lane, `inst · ${instrumentLabel(kind)}`)
+  renderInstrumentLane(lane, true)
+  renderDetail()
+}
+
+/** "Instrument" picker at the top of an instrument track's detail. */
+function buildInstrumentPicker(lane: Lane): HTMLElement {
+  const sec = section('Instrument')
+  const mt = lane.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+  if (!mt?.instrument) return sec
+  const row = document.createElement('label')
+  row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:0 0 4px;font-size:11px;color:var(--dim)'
+  row.append('Sound')
+  const sel = document.createElement('select')
+  sel.style.cssText = 'flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 4px;font-size:11px'
+  for (const i of listInstruments()) {
+    const o = document.createElement('option')
+    o.value = i.kind
+    o.textContent = i.label
+    sel.appendChild(o)
+  }
+  sel.value = normalizeInstrumentKind(mt.instrument.kind)
+  sel.addEventListener('change', () => swapInstrument(lane, sel.value))
+  row.appendChild(sel)
+  sec.appendChild(row)
+  const hint = document.createElement('div')
+  hint.style.cssText = 'font-size:10px;color:var(--dim);line-height:1.4'
+  hint.textContent = 'Swap the sound; notes, strip, inserts and fader stay.'
+  sec.appendChild(hint)
+  return sec
+}
+
+/** Detail-pane controls for a track's MIDI ports: keyboard input (recording) and external output. */
+function buildMidiIoSection(lane: Lane): HTMLElement {
+  const mt = lane.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+  const sec = section('MIDI I/O')
+  if (!mt) return sec
+  const rowCss = 'display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:11px;color:var(--dim)'
+  const selCss = 'flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 4px;font-size:11px'
+
+  const portSel = (label: string, ports: { id: string; name: string }[], cur: string | null, set: (v: string | null) => void): HTMLElement => {
+    const row = document.createElement('label')
+    row.style.cssText = rowCss
+    row.append(label)
+    const sel = document.createElement('select')
+    sel.style.cssText = selCss
+    const add = (v: string, text: string): void => {
+      const o = document.createElement('option')
+      o.value = v
+      o.textContent = text
+      sel.appendChild(o)
+    }
+    add('', 'none')
+    for (const p of ports) add(p.id, p.name)
+    if (cur && !ports.some((p) => p.id === cur)) add(cur, '(unplugged)')
+    sel.value = cur ?? ''
+    sel.addEventListener('change', () => set(sel.value || null))
+    row.appendChild(sel)
+    return row
+  }
+
+  sec.appendChild(portSel('In', midiIo.inputs(), mt.inId, (v) => (mt.inId = v)))
+  sec.appendChild(portSel('Out', midiIo.outputs(), mt.outId, (v) => (mt.outId = v)))
+
+  const chRow = document.createElement('label')
+  chRow.style.cssText = rowCss
+  chRow.append('Channel')
+  const ch = document.createElement('select')
+  ch.style.cssText = selCss
+  for (let i = 0; i < 16; i++) {
+    const o = document.createElement('option')
+    o.value = String(i)
+    o.textContent = String(i + 1)
+    ch.appendChild(o)
+  }
+  ch.value = String(mt.channel)
+  ch.addEventListener('change', () => (mt.channel = Number(ch.value)))
+  chRow.appendChild(ch)
+  sec.appendChild(chRow)
+
+  const dRow = document.createElement('label')
+  dRow.style.cssText = rowCss
+  dRow.title = 'Delay MIDI output to line an external synth up with the audio device latency'
+  dRow.append('Out delay')
+  const dl = document.createElement('input')
+  dl.type = 'number'
+  dl.step = '1'
+  dl.min = '-200'
+  dl.max = '500'
+  dl.value = String(midiIo.outDelayMs)
+  dl.style.cssText = selCss
+  dl.addEventListener('change', () => midiIo.setOutDelay(Number(dl.value) || 0))
+  dRow.append(dl, 'ms')
+  sec.appendChild(dRow)
+
+  const hint = document.createElement('div')
+  hint.style.cssText = 'font-size:10px;color:var(--dim);line-height:1.4'
+  hint.textContent = 'Arm the track (R) with an input set, then Rec to record notes. Output plays to the port while the transport runs.'
+  sec.appendChild(hint)
+  return sec
+}
+
+/** Detail-pane controls for a drum-machine track (kit tuning; the pattern is edited in the step grid). */
+function buildDrumSection(lane: Lane, mt: MidiTrack): HTMLElement {
+  const sec = section('Drum machine')
+  const sp = mt.instrument?.params as DrumParams
+  const touch = (): void => scheduleInstrumentRender(lane)
+  const mkBtn = (label: string, fn: () => void): HTMLButtonElement => {
+    const b = document.createElement('button')
+    b.className = 'sat-mode'
+    b.textContent = label
+    b.style.cssText = 'width:100%;margin-bottom:6px'
+    b.addEventListener('click', fn)
+    return b
+  }
+  sec.appendChild(mkBtn('▦ Step sequencer…', () => openTrackEditor(mt)))
+  sec.appendChild(mkBtn('♪ Piano roll…', () => openPianoRoll(mt)))
+  const grid = document.createElement('div')
+  grid.className = 'knob-grid'
+  const k = (label: string, min: number, max: number, get: () => number, set: (v: number) => void, def: number, fmt: (v: number) => string): void => {
+    grid.appendChild(
+      makeKnob({
+        min, max, value: get(), default: def, label, fmt,
+        onInput: (v) => {
+          set(v)
+          touch()
+        }
+      })
+    )
+  }
+  const x2 = (v: number): string => `${v.toFixed(2)}x`
+  const pctf = (v: number): string => `${Math.round(v * 100)}%`
+  k('Tune', 0.7, 1.4, () => sp.tune, (v) => (sp.tune = v), 1, x2)
+  k('Kick len', 0.4, 2.5, () => sp.kickDecay, (v) => (sp.kickDecay = v), 1, x2)
+  k('Punch', 0, 1, () => sp.kickPunch, (v) => (sp.kickPunch = v), 0.5, pctf)
+  k('Snap', 0, 2, () => sp.snareSnap, (v) => (sp.snareSnap = v), 1, x2)
+  k('Hat len', 0.4, 2.5, () => sp.hatDecay, (v) => (sp.hatDecay = v), 1, x2)
+  k('Gain', 0, 2, () => sp.gain, (v) => (sp.gain = v), 1, x2)
+  sec.appendChild(grid)
+  return sec
+}
+
+/** Detail-pane controls for an FM track: preset + a few macros (full operator editing is via the params JSON / MCP). */
+function buildFmSection(lane: Lane, mt: MidiTrack): HTMLElement {
+  const early = !!mt.instrument && normalizeInstrumentKind(mt.instrument.kind) === 'earlysynth'
+  const names = early ? EARLY_PRESET_NAMES : FM_PRESET_NAMES
+  const load = early ? earlyPreset : fmPreset
+  const sec = section(early ? 'EarlySynth' : 'FM synth')
+  const sp = mt.instrument?.params as FmParams
+  const touch = (): void => scheduleInstrumentRender(lane)
+
+  const row = document.createElement('label')
+  row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:11px;color:var(--dim)'
+  row.append('Preset')
+  const sel = document.createElement('select')
+  sel.style.cssText = 'flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 4px;font-size:11px'
+  for (const n of names) {
+    const o = document.createElement('option')
+    o.value = n
+    o.textContent = n
+    sel.appendChild(o)
+  }
+  sel.value = names.includes(sp.preset) ? sp.preset : names[0]
+  sel.addEventListener('change', () => {
+    const fresh = load(sel.value)
+    if (!fresh || !mt.instrument) return
+    mt.instrument.params = fresh // new preset = new values, macros reset
+    renderInstrumentLane(lane)
+    renderDetail()
+  })
+  row.appendChild(sel)
+  sec.appendChild(row)
+
+  const rollBtn = document.createElement('button')
+  rollBtn.className = 'sat-mode'
+  rollBtn.textContent = '♪ Piano roll…'
+  rollBtn.style.cssText = 'width:100%;margin-bottom:10px'
+  rollBtn.addEventListener('click', () => openPianoRoll(mt))
+  sec.appendChild(rollBtn)
+
+  const grid = document.createElement('div')
+  grid.className = 'knob-grid'
+  const k = (label: string, min: number, max: number, get: () => number, set: (v: number) => void, def: number, fmt: (v: number) => string): void => {
+    grid.appendChild(
+      makeKnob({
+        min, max, value: get(), default: def, label, fmt,
+        onInput: (v) => {
+          set(v)
+          touch()
+        }
+      })
+    )
+  }
+  const x2 = (v: number): string => `${v.toFixed(2)}x`
+  const pctf = (v: number): string => `${Math.round(v * 100)}%`
+  k('Index', 0, 2.5, () => sp.index, (v) => (sp.index = v), 1, x2)
+  k('Click', 0, 1, () => sp.click, (v) => (sp.click = v), sp.click, pctf)
+  k('Punch', 0, 24, () => sp.pitchPunch, (v) => (sp.pitchPunch = v), sp.pitchPunch, (v) => `${v.toFixed(1)} st`)
+  k('Atk x', 0.3, 4, () => sp.atkScale, (v) => (sp.atkScale = v), 1, x2)
+  k('Rel x', 0.2, 4, () => sp.relScale, (v) => (sp.relScale = v), 1, x2)
+  k('Gain', 0, 2, () => sp.gain, (v) => (sp.gain = v), 1, x2)
+  sec.appendChild(grid)
+  return sec
+}
+
+/** Detail-pane controls for an instrument lane's synth (edits re-render on the GPU). */
+function buildSynthSection(lane: Lane): HTMLElement {
+  const mt = lane.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+  if (mt?.instrument?.kind === 'drums') return buildDrumSection(lane, mt)
+  if (mt?.instrument && ['earlysynth', 'fm'].includes(normalizeInstrumentKind(mt.instrument.kind))) return buildFmSection(lane, mt)
+  const sec = section('Synth')
+  if (!mt || !mt.instrument || mt.instrument.kind !== 'synth') return sec
+  const sp = mt.instrument.params as SynthParams
+  const touch = (): void => scheduleInstrumentRender(lane)
+
+  const rollBtn = document.createElement('button')
+  rollBtn.className = 'sat-mode'
+  rollBtn.textContent = '♪ Piano roll…'
+  rollBtn.style.cssText = 'width:100%;margin-bottom:10px'
+  rollBtn.addEventListener('click', () => openPianoRoll(mt))
+  sec.appendChild(rollBtn)
+
+  const waves = document.createElement('div')
+  waves.className = 'td-btns'
+  waves.style.marginBottom = '14px'
+  const mk = (label: string, w: SynthWave): HTMLButtonElement => {
+    const b = document.createElement('button')
+    b.className = 'sat-mode'
+    b.textContent = label
+    b.classList.toggle('on', sp.wave === w)
+    b.addEventListener('click', () => {
+      sp.wave = w
+      waves.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b))
+      touch()
+    })
+    return b
+  }
+  waves.append(mk('Saw', 'saw'), mk('Sq', 'square'), mk('Tri', 'tri'), mk('Sine', 'sine'))
+  sec.appendChild(waves)
+
+  const grid = document.createElement('div')
+  grid.className = 'knob-grid'
+  const sec2 = (v: number): string => `${v.toFixed(2)} s`
+  const k = (
+    label: string,
+    min: number,
+    max: number,
+    get: () => number,
+    set: (v: number) => void,
+    def: number,
+    fmt: (v: number) => string
+  ): void => {
+    grid.appendChild(
+      makeKnob({
+        min,
+        max,
+        value: get(),
+        default: def,
+        label,
+        fmt,
+        onInput: (v) => {
+          set(v)
+          touch()
+        }
+      })
+    )
+  }
+  const pctf = (v: number): string => `${Math.round(v * 100)}%`
+  k('Detune', 0, 60, () => sp.detuneCents, (v) => (sp.detuneCents = v), 12, (v) => `${v.toFixed(0)} ct`)
+  k('Sub', 0, 1, () => sp.sub, (v) => (sp.sub = v), 0.3, pctf)
+  k('Spread', 0, 1, () => sp.spread, (v) => (sp.spread = v), 0.6, pctf)
+  k('Width', 0.05, 0.95, () => sp.pw, (v) => (sp.pw = v), 0.5, pctf)
+  k('Atk', 0, 1, () => sp.atk, (v) => (sp.atk = v), 0.01, sec2)
+  k('Dec', 0, 2, () => sp.dec, (v) => (sp.dec = v), 0.2, sec2)
+  k('Sus', 0, 1, () => sp.sus, (v) => (sp.sus = v), 0.7, pctf)
+  k('Rel', 0, 3, () => sp.rel, (v) => (sp.rel = v), 0.25, sec2)
+  // cutoff is musical on a log scale: knob 0..1 → 80 Hz .. 20 kHz
+  const toHz = (x: number): number => 80 * Math.pow(250, x)
+  const toKnob = (hz: number): number => Math.log(Math.max(80, hz) / 80) / Math.log(250)
+  k('Cutoff', 0, 1, () => toKnob(sp.cutoffHz), (v) => (sp.cutoffHz = toHz(v)), toKnob(9000), (v) => {
+    const hz = toHz(v)
+    return hz >= 1000 ? `${(hz / 1000).toFixed(1)} kHz` : `${hz.toFixed(0)} Hz`
+  })
+  k('Res', 0, 1, () => sp.res, (v) => (sp.res = v), 0.2, pctf)
+  k('Gain', 0, 2, () => sp.gain, (v) => (sp.gain = v), 1, (v) => `${v.toFixed(2)}x`)
+  sec.appendChild(grid)
+  return sec
 }
 
 const clipGainLin = (db: number): number => (db <= -60 ? 0 : Math.pow(10, db / 20))
@@ -624,19 +1355,6 @@ function pickAudio(key: string | null): void {
   renderAudioList() // refresh the row's .sel state
 }
 
-/** Cheap pre-fader meter level: the source envelope under the playhead. */
-function laneMeterLevel(lane: Lane, playheadFrame: number): number {
-  for (const c of lane.clips) {
-    if (playheadFrame < c.startFrame || playheadFrame >= clipEnd(c)) continue
-    const s = getSource(c.sourceId)
-    if (!s?.envelope) continue
-    const srcFrame = c.srcOffset + (playheadFrame - c.startFrame)
-    const idx = Math.floor(srcFrame / state.sampleRate / ENV_WINDOW_S)
-    return s.envelope[idx] || 0
-  }
-  return 0
-}
-
 // ---- right pane: audio (source + clip) list ------------------------------
 
 /** Seconds → "m:ss" for list rows. */
@@ -680,6 +1398,7 @@ function renderAudioList(): void {
   let nClips = 0
   const rows: HTMLElement[] = []
   for (const lane of lanes) {
+    if (lane.inst) continue // instrument lanes list their MIDI in the piano roll, not a rendered clip
     for (const c of lane.clips) {
       nClips++
       const src = getSource(c.sourceId)
@@ -696,7 +1415,7 @@ function renderAudioList(): void {
   for (const r of rows) secC.appendChild(r)
   host.appendChild(secC)
 
-  const srcs = sourceList()
+  const srcs = sourceList().filter((s) => s.kind !== 'inst')
   const secS = document.createElement('div')
   secS.className = 'al-section'
   secS.innerHTML = `<h4>Sources · ${srcs.length}</h4>`
@@ -906,6 +1625,7 @@ function onEditPointerDown(e: PointerEvent): void {
   const laneEl = (e.target as HTMLElement).closest('.lane')
   const lane = lanes.find((l) => l.el === laneEl)
   if (!lane) return
+  if (lane.inst) return // the rendered audio is not edited directly; double-click opens the notes
   const centerR = (lane.el.querySelector('.lane-center') as HTMLElement).getBoundingClientRect()
   if (e.clientX < centerR.left || e.clientX > centerR.right) return // left/right gutters
   const frameAt = (clientX: number): number => state.scrollFrames + (clientX - centerR.left) * state.framesPerPixel
@@ -1249,6 +1969,81 @@ function setTool(t: EditTool): void {
   viewDirty = true
 }
 
+/**
+ * An instrument lane shows its MIDI, not the audio the GPU renders from it: indigo background, one
+ * block per MIDI clip, a bar per note (all clips share one pitch scale; drums are coloured per voice).
+ */
+function drawMidiClips(lane: Lane, g: CanvasRenderingContext2D, cssW: number, cssH: number, toX: (f: number) => number): void {
+  g.fillStyle = '#14122a'
+  g.fillRect(0, 0, cssW, cssH)
+  const mt = lane.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+  if (!mt) return
+  const drums = mt.instrument?.kind === 'drums'
+  const { bpm, sampleRate: sr } = state
+  const sel = lane.id === selectedId
+  const bf = (b: number): number => beatsToFrames(b, bpm, sr)
+
+  let lo = 127
+  let hi = 0
+  for (const c of mt.clips) for (const n of c.notes) {
+    if (n.key < lo) lo = n.key
+    if (n.key > hi) hi = n.key
+  }
+  if (hi < lo) {
+    lo = 60
+    hi = 72
+  }
+  const span = Math.max(12, hi - lo + 1) // at least an octave, so a lone note does not fill the lane
+  const top = (lo + hi) / 2 + span / 2 // key at the top edge
+  const y0 = 13
+  const rowH = (cssH - y0 - 2) / span
+
+  for (const c of mt.clips) {
+    const xL = toX(bf(c.start))
+    const xR = toX(bf(c.start + c.length))
+    if (xR < 0 || xL > cssW) continue
+    g.fillStyle = sel ? 'rgba(139,123,255,0.22)' : 'rgba(139,123,255,0.13)'
+    g.fillRect(xL, 0, xR - xL, cssH)
+    for (const n of c.notes) {
+      const x1 = toX(bf(c.start + n.start))
+      const x2 = toX(bf(c.start + n.start + n.dur))
+      if (x2 < 0 || x1 > cssW) continue
+      const y = y0 + (top - n.key - 1) * rowH
+      const a = 0.45 + 0.55 * (n.vel / 127)
+      g.fillStyle = drums ? `hsla(${(n.key * 37) % 360},70%,66%,${a})` : `rgba(190,178,255,${a})`
+      g.fillRect(x1, y, Math.max(1.5, x2 - x1 - 0.5), Math.max(1.5, rowH - 0.5))
+    }
+    g.strokeStyle = sel ? '#b9afff' : 'rgba(150,135,255,0.55)'
+    g.strokeRect(Math.round(xL) + 0.5, 0.5, Math.max(1, Math.round(xR - xL) - 1), cssH - 1)
+    const nameW = xR - xL - 8
+    if (nameW > 12) {
+      g.save()
+      g.beginPath()
+      g.rect(xL + 4, 0, nameW, 12)
+      g.clip()
+      g.fillStyle = sel ? '#ece9ff' : 'rgba(205,198,255,0.8)'
+      g.font = '10px -apple-system, "Segoe UI", sans-serif'
+      g.textBaseline = 'top'
+      g.fillText(`${c.name}  ·  ${c.notes.length} notes`, xL + 5, 1)
+      g.restore()
+    }
+  }
+}
+
+/** A line-input lane has no clips: an amber band says where it is live. */
+function drawLiveLane(lane: Lane, g: CanvasRenderingContext2D, cssW: number, cssH: number): void {
+  g.fillStyle = '#241a0c'
+  g.fillRect(0, 0, cssW, cssH)
+  g.fillStyle = 'rgba(255,180,84,0.10)'
+  g.fillRect(0, 0, cssW, cssH)
+  g.strokeStyle = 'rgba(255,180,84,0.35)'
+  g.strokeRect(0.5, 0.5, cssW - 1, cssH - 1)
+  g.fillStyle = 'rgba(255,200,130,0.85)'
+  g.font = '11px -apple-system, "Segoe UI", sans-serif'
+  g.textBaseline = 'middle'
+  g.fillText(`LINE IN · ${lane.recIn.stereo ? `In ${lane.recIn.ch + 1}-${lane.recIn.ch + 2}` : `In ${lane.recIn.ch + 1}`} · live through strip + inserts${lane.live?.monitor ? '' : ' (monitor off)'}`, 10, cssH / 2)
+}
+
 /** Draw one lane's clip chrome (borders / selection / fades / handles / range). */
 function drawLaneFx(lane: Lane): void {
   const g = lane.fxCtx
@@ -1265,18 +2060,22 @@ function drawLaneFx(lane: Lane): void {
   const fpp = state.framesPerPixel
   const toX = (f: number): number => (f - state.scrollFrames) / fpp
 
-  for (const c of lane.clips) {
+  if (lane.inst) drawMidiClips(lane, g, cssW, cssH, toX)
+  else if (lane.live) drawLiveLane(lane, g, cssW, cssH)
+
+  // (an instrument lane's rendered audio clip is an implementation detail, not drawn or edited)
+  for (const c of lane.inst ? [] : lane.clips) {
     const xL = toX(c.startFrame)
     const xR = toX(clipEnd(c))
     if (xR < 0 || xL > cssW) continue
     const sel = selClips.has(c.id)
 
     if (sel) {
-      g.fillStyle = 'rgba(120,220,180,0.10)'
+      g.fillStyle = 'rgba(255,255,255,0.16)'
       g.fillRect(xL, 0, xR - xL, cssH)
     }
     // fade ramps
-    g.strokeStyle = sel ? 'rgba(160,245,210,0.95)' : 'rgba(150,220,190,0.55)'
+    g.strokeStyle = sel ? 'rgba(255,255,255,0.95)' : 'rgba(25,28,34,0.6)'
     g.lineWidth = 1
     if (c.fadeIn > 0) {
       g.beginPath()
@@ -1291,7 +2090,7 @@ function drawLaneFx(lane: Lane): void {
       g.stroke()
     }
     // outline
-    g.strokeStyle = sel ? '#8ef0c8' : 'rgba(120,200,170,0.5)'
+    g.strokeStyle = sel ? '#ffffff' : 'rgba(0,0,0,0.28)' // no green frame: a faint dark edge, white when selected
     g.strokeRect(Math.round(xL) + 0.5, 0.5, Math.max(1, Math.round(xR - xL) - 1), cssH - 1)
     // name
     const nameW = xR - xL - 8
@@ -1300,7 +2099,7 @@ function drawLaneFx(lane: Lane): void {
       g.beginPath()
       g.rect(xL + 4, 0, nameW, 13)
       g.clip()
-      g.fillStyle = sel ? '#e6fff5' : 'rgba(205,235,222,0.72)'
+      g.fillStyle = sel ? '#ffffff' : 'rgba(18,21,27,0.78)'
       g.font = '10px -apple-system, "Segoe UI", sans-serif'
       g.textBaseline = 'top'
       g.fillText(c.name, xL + 5, 2)
@@ -1308,7 +2107,7 @@ function drawLaneFx(lane: Lane): void {
     }
     // corner fade handles (only when selected)
     if (sel) {
-      g.fillStyle = '#8ef0c8'
+      g.fillStyle = '#ffffff'
       g.fillRect(xL - 3, 0, 6, 6)
       g.fillRect(xR - 3, 0, 6, 6)
     }
@@ -1332,6 +2131,7 @@ function selectLane(id: number | 'master' | null): void {
     l.el.classList.toggle('selected', l.id === id)
     l.strip.el.classList.toggle('selected', l.id === id) // mixer strip: highlight the fader area
   }
+  for (const g of groups) g.strip.el.classList.toggle('selected', g.id === id)
   masterStripEl.classList.toggle('selected', id === 'master')
   renderDetail()
 }
@@ -1478,7 +2278,7 @@ const FX_KINDS: FxKind[] = [
   { label: 'Bus Comp', short: 'BusComp', make: () => new BusCompInsert(), is: (fx) => fx instanceof BusCompInsert, masterOnly: true },
   { label: 'Maximizer', short: 'Maxim', make: () => new MaximizerInsert(), is: (fx) => fx instanceof MaximizerInsert, masterOnly: true }
 ]
-/** Fixed insert-slot count per strip (Cubase-style rack). */
+/** Fixed insert-slot count per strip (classic rack). */
 const SLOT_COUNT = 8
 
 function fxLabel(fx: Insert): string {
@@ -1489,7 +2289,7 @@ function fxShort(fx: Insert): string {
 }
 
 // ---- floating plugin windows ---------------------------------------------------
-// Pro Tools behaviour: normally a single un-pinned window is shown — opening
+// Classic behaviour: normally a single un-pinned window is shown — opening
 // another closes it. Pin (📌) a window and it stays put; later un-pinned opens
 // only replace each other. Non-modal — the mixer / tracks stay interactive.
 
@@ -1539,6 +2339,8 @@ function closeAllPlugWins(): void {
 /** Display name for a plugin-window owner: the track title, or "MASTER". */
 function ownerLabel(owner: number | 'master'): string {
   if (owner === 'master') return 'MASTER'
+  const grp = groupById(owner)
+  if (grp) return grp.name
   const lane = lanes.find((l) => l.id === owner)
   return (lane?.el.querySelector('.lane-title') as HTMLElement | null)?.textContent || `Track ${owner}`
 }
@@ -1578,7 +2380,7 @@ function openPlugWin(fx: Insert, owner: number | 'master'): void {
   bar.append(nm, spacer, byp, pin, close)
   const body = document.createElement('div')
   body.className = 'plug-win-body'
-  const panel = document.createElement('div') // inset control panel (Cubase-style)
+  const panel = document.createElement('div') // inset control panel (console-style)
   panel.className = 'plug-panel'
   // Reverb / Delay have few controls — give them a taller, airier panel.
   if (fx instanceof ReverbInsert || fx instanceof DelayInsert) panel.classList.add('plug-panel-tall')
@@ -1707,12 +2509,67 @@ function openFxMenu(
  * left detail pane. Empty slot: click opens the plugin pick menu (appends).
  * `owner` is the lane id or 'master' — used to refresh both UIs after a change.
  */
+/** Status line message from module-level code (bound to boot()'s flashStatus once it exists). */
+let notify: (msg: string, isErr?: boolean) => void = () => {}
+
+/** The insert being dragged between slots (set on dragstart, cleared on dragend). */
+let slotDrag: { fx: Insert; list: Insert[]; owner: number | 'master' } | null = null
+
+/** Drop the dragged insert at `to` of `list` (same rack: reorder; another rack: move it there). */
+function dropSlot(list: Insert[], owner: number | 'master', to: number): void {
+  const d = slotDrag
+  slotDrag = null
+  if (!d) return
+  const from = d.list.indexOf(d.fx)
+  const masterOnly = FX_KINDS.find((k) => k.is(d.fx))?.masterOnly
+  if (d.list !== list && masterOnly && owner !== 'master') {
+    notify(`${fxLabel(d.fx)} can only sit on the master bus`, true)
+    return
+  }
+  if (d.list !== list && list.length >= SLOT_COUNT) {
+    notify('that rack is full', true)
+    return
+  }
+  if (!moveSlot(d.list, from, list, to, SLOT_COUNT)) return
+  if (d.owner !== owner) closePlugWin(d.fx) // its floating window belonged to the other channel
+  refreshInsertsUI(d.owner)
+  if (d.owner !== owner) refreshInsertsUI(owner)
+}
+
 function fillRack(rackEl: HTMLElement, list: Insert[], owner: number | 'master'): void {
   rackEl.replaceChildren()
   for (let i = 0; i < SLOT_COUNT; i++) {
     const fx: Insert | undefined = list[i]
     const slot = document.createElement('div')
     slot.className = fx ? 'strip-slot filled' : 'strip-slot'
+    // drag a plug-in to another slot (same rack = reorder; another channel's rack = move it there)
+    slot.addEventListener('dragover', (e) => {
+      if (!slotDrag) return
+      e.preventDefault()
+      slot.classList.add('drop')
+    })
+    slot.addEventListener('dragleave', () => slot.classList.remove('drop'))
+    slot.addEventListener('drop', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      slot.classList.remove('drop')
+      dropSlot(list, owner, fx ? i : list.length)
+    })
+    if (fx) {
+      slot.draggable = true
+      slot.title = 'drag to move to another slot (or another channel)'
+      slot.addEventListener('dragstart', (e) => {
+        slotDrag = { fx, list, owner }
+        e.dataTransfer?.setData('text/plain', fxShort(fx))
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+        slot.classList.add('dragging')
+      })
+      slot.addEventListener('dragend', () => {
+        slot.classList.remove('dragging')
+        slotDrag = null
+        document.querySelectorAll('.strip-slot.drop').forEach((x) => x.classList.remove('drop'))
+      })
+    }
     if (fx) {
       const byp = document.createElement('button')
       byp.className = 'slot-byp'
@@ -1797,6 +2654,11 @@ function fillRack(rackEl: HTMLElement, list: Insert[], owner: number | 'master')
 function renderStripRack(owner: number | 'master'): void {
   if (owner === 'master') {
     if (masterRackEl && masterBusInserts) fillRack(masterRackEl, masterBusInserts, 'master')
+    return
+  }
+  const grp = groupById(owner)
+  if (grp) {
+    fillRack(grp.strip.rackEl, grp.inserts, owner)
     return
   }
   const lane = lanes.find((l) => l.id === owner)
@@ -1886,7 +2748,7 @@ function buildFxParams(body: HTMLElement, fx: Insert): void {
       body.appendChild(bx)
     })
   } else if (fx instanceof TubeEqInsert) {
-    // Pultec EQP-1A homage: 12AX7 buffer → passive program EQ → 12AX7 make-up.
+    // Tube program EQ: 12AX7 buffer → passive program EQ → 12AX7 make-up.
     // Sections follow the real front panel: INPUT · LOW · HIGH BOOST ·
     // HIGH ATTEN · OUTPUT. Boost / Atten dials are 0..10 (0 = flat); the
     // frequency knobs step through the actual switch positions. Double-click
@@ -1992,7 +2854,7 @@ function buildFxParams(body: HTMLElement, fx: Insert): void {
     )
     body.appendChild(grid)
   } else if (fx instanceof BusCompInsert) {
-    // SSL-G-bus-style master comp: stepped ratio / attack / release, plus a
+    // SL-G-bus-style master comp: stepped ratio / attack / release, plus a
     // Drive knob for the bright harmonic colour and a parallel-comp Mix.
     const p = fx.params
     const stepped = (
@@ -2130,6 +2992,64 @@ function renderDetail(): void {
     return
   }
 
+  // ---- group channel view: name, its tracks, delete, and its insert rack ----
+  const grp = typeof selectedId === 'number' ? groupById(selectedId) : undefined
+  if (grp) {
+    const gh = document.createElement('div')
+    gh.id = 'td-head'
+    const gn = document.createElement('span')
+    gn.className = 'n'
+    gn.textContent = `G${grp.id - GROUP_ID_BASE}`
+    const gt = document.createElement('input')
+    gt.type = 'text'
+    gt.className = 'td-gname'
+    gt.value = grp.name
+    gt.maxLength = 40
+    gt.addEventListener('keydown', (e) => e.stopPropagation())
+    gt.addEventListener('change', () => {
+      grp.name = cleanStemName(gt.value) || grp.name
+      gt.value = grp.name
+      ;(grp.strip.el.querySelector('.strip-head .t') as HTMLElement).textContent = grp.name
+    })
+    const del = document.createElement('button')
+    del.textContent = 'Delete'
+    del.title = 'Delete this group (its tracks go straight to the master)'
+    del.addEventListener('click', () => removeGroup(grp.id))
+    gh.append(gn, gt, del)
+    trackDetailEl.appendChild(gh)
+    const members = lanes.filter((l) => l.group === grp.id)
+    const mem = document.createElement('div')
+    mem.className = 'td-empty'
+    mem.textContent = members.length
+      ? `tracks: ${members.map((l) => (l.el.querySelector('.lane-title') as HTMLElement).textContent).join(', ')}`
+      : 'no tracks routed here (pick Output on a track)'
+    trackDetailEl.appendChild(mem)
+    buildDetailSlots(trackDetailEl, grp.inserts, grp.id)
+    // colour: the last thing in the pane
+    const row = document.createElement('div')
+    row.id = 'td-color'
+    const lab = document.createElement('span')
+    lab.className = 'lbl'
+    lab.textContent = 'Color'
+    row.append(lab)
+    for (const c of TRACK_PALETTE) {
+      const b = document.createElement('button')
+      b.className = c === grp.color ? 'sw on' : 'sw'
+      b.style.background = c
+      b.title = `${c} — also the colour of the group's tracks that have no stem`
+      b.addEventListener('click', () => {
+        grp.color = c
+        applyGroupColor(grp)
+        for (const l of lanes) if (l.group === grp.id) adoptGroupColor(l, grp)
+        renderDetail()
+      })
+      row.append(b)
+    }
+    trackDetailEl.appendChild(row)
+    paneScroll.scrollTop = savedScroll
+    return
+  }
+
   const lane = typeof selectedId === 'number' ? (lanes.find((l) => l.id === selectedId) ?? null) : null
 
   if (!lane) {
@@ -2153,8 +3073,71 @@ function renderDetail(): void {
   head.append(hn, ht)
   trackDetailEl.appendChild(head)
 
+  // ---- stem: tracks with the same name are exported together as one stem file ----
+  {
+    const row = document.createElement('div')
+    row.id = 'td-stem'
+    const lab = document.createElement('span')
+    lab.textContent = 'Stem'
+    const inp = document.createElement('input')
+    inp.type = 'text'
+    inp.maxLength = 40
+    inp.placeholder = '（なし）'
+    inp.value = lane.stem ?? ''
+    inp.setAttribute('list', 'stem-names')
+    inp.title = 'Stem name — tracks with the same name are exported together (File → Export → Stems…)'
+    const dl = document.createElement('datalist')
+    dl.id = 'stem-names'
+    for (const n of new Set(lanes.map((l) => l.stem ?? '').filter(Boolean))) {
+      const o = document.createElement('option')
+      o.value = n
+      dl.append(o)
+    }
+    inp.addEventListener('change', () => {
+      lane.stem = cleanStemName(inp.value)
+      inp.value = lane.stem
+      alignStem(lane) // the stem's tracks share one colour
+      renderDetail()
+    })
+    inp.addEventListener('keydown', (e) => e.stopPropagation()) // typing a name must not trigger transport / edit keys
+    row.append(lab, inp, dl)
+    trackDetailEl.appendChild(row)
+  }
+
+  // ---- output: straight to the master, or into a group channel ----
+  {
+    const row = document.createElement('div')
+    row.id = 'td-out'
+    const lab = document.createElement('span')
+    lab.textContent = 'Output'
+    const sel = document.createElement('select')
+    const addOpt = (value: string, text: string): void => {
+      const o = document.createElement('option')
+      o.value = value
+      o.textContent = text
+      sel.append(o)
+    }
+    addOpt('', 'Master')
+    for (const g of groups) addOpt(String(g.id), g.name)
+    sel.value = lane.group !== undefined && groupById(lane.group) ? String(lane.group) : ''
+    sel.addEventListener('change', () => {
+      lane.group = sel.value ? Number(sel.value) : undefined
+      adoptGroupColor(lane, lane.group !== undefined ? groupById(lane.group) : undefined)
+      renderDetail()
+    })
+    row.append(lab, sel)
+    trackDetailEl.appendChild(row)
+  }
+
   // ---- insert plugins (slot rack at the top; params open in floating windows) ----
   buildDetailSlots(trackDetailEl, lane.inserts, lane.id)
+
+  if (lane.inst) {
+    trackDetailEl.appendChild(buildInstrumentPicker(lane))
+    trackDetailEl.appendChild(buildSynthSection(lane))
+    trackDetailEl.appendChild(buildMidiIoSection(lane))
+  }
+  if (lane.live) trackDetailEl.appendChild(buildLiveSection(lane))
 
   const sp = lane.dsp.params
 
@@ -2411,18 +3394,142 @@ function renderDetail(): void {
     },
     vuEl: vuInner
   }
+  // ---- colour: the lane is painted with it (a stem's tracks share one colour); the last thing in the pane ----
+  {
+    const row = document.createElement('div')
+    row.id = 'td-color'
+    const lab = document.createElement('span')
+    lab.className = 'lbl'
+    lab.textContent = 'Color'
+    row.append(lab)
+    const cur = normalizeColor(lane.color) ?? TRACK_PALETTE[0]
+    for (const c of TRACK_PALETTE) {
+      const b = document.createElement('button')
+      b.className = c === cur ? 'sw on' : 'sw'
+      b.style.background = c
+      b.title = lane.stem ? `${c} — applies to every track of stem "${lane.stem}"` : c
+      b.addEventListener('click', () => {
+        setLaneColor(lane, c)
+        renderDetail()
+      })
+      row.append(b)
+    }
+    trackDetailEl.appendChild(row)
+  }
+
   paneScroll.scrollTop = savedScroll
 }
 
 /** Resolve a lane's mix to a GPU MixSource, applying mute/solo. */
 function laneToSource(l: Lane): MixSource {
-  const audible = !l.mix.mute && (!anySolo || l.mix.solo)
+  const grp = l.group !== undefined ? groupById(l.group) : undefined
+  // soloing a group lets all of its tracks through
+  const audible = !l.mix.mute && (!anySolo || l.mix.solo || !!grp?.mix.solo)
+  const gi = grp ? groups.indexOf(grp) : -1
   return {
     clips: resolveLaneClips(l),
     mix: { gain: audible ? dbToLin(l.mix.gainDb) : 0, pan: l.mix.pan },
     strip: l.dsp,
-    inserts: l.inserts
+    inserts: l.inserts,
+    ...(gi >= 0 ? { group: gi } : {})
   }
+}
+
+/** Stem name -> colour: every track of a stem wears the same one. */
+let stemColorTable: Record<string, string> = {}
+
+/** Paint a lane (timeline row, waveform, mixer strip) in its track colour. */
+function applyLaneColor(lane: Lane): void {
+  const paint = lanePaint(lane.color ?? TRACK_PALETTE[0])
+  lane.renderer.setColors(paint.bg, paint.wave, paint.fill)
+  lane.el.style.setProperty('--track', paint.css)
+  lane.strip.el.style.setProperty('--track', paint.css)
+  lane.dirty = true
+}
+
+/**
+ * A stem was chosen for `lane` (or a colour was picked on it): make every track of that stem the same colour.
+ * Tracks without a stem keep their own colour.
+ */
+function alignStem(lane: Lane, recolor = false): void {
+  const idx = lanes.indexOf(lane)
+  if (idx < 0) return
+  const r = alignStemColors(
+    lanes.map((l) => ({ stem: l.stem ?? '', color: l.color ?? TRACK_PALETTE[0] })),
+    stemColorTable,
+    idx,
+    recolor
+  )
+  stemColorTable = pruneStemColors(lanes.map((l) => l.stem ?? ''), r.stemColors)
+  lanes.forEach((l, i) => {
+    if (l.color !== r.colors[i]) {
+      l.color = r.colors[i]
+      applyLaneColor(l)
+    }
+  })
+}
+
+/** Colour a track by hand (a stem's tracks follow). */
+function setLaneColor(lane: Lane, color: string): void {
+  const c = normalizeColor(color)
+  if (!c) return
+  lane.color = c
+  if (lane.stem) alignStem(lane, true)
+  else applyLaneColor(lane)
+}
+
+function applyGroupColor(g: Group): void {
+  g.strip.el.style.setProperty('--track', lanePaint(g.color).css)
+}
+
+/** A track routed into a group takes the group's colour (a stem's colour wins when it has one). */
+function adoptGroupColor(lane: Lane, g: Group | undefined): void {
+  if (!g || lane.stem) return
+  if (lane.color !== g.color) {
+    lane.color = g.color
+    applyLaneColor(lane)
+  }
+}
+
+/** Create a group channel (and its mixer strip). `id` is given when restoring a project. */
+function addGroup(name: string, id?: number): Group {
+  const gid = id !== undefined && !groupById(id) ? id : nextGroupId++
+  if (gid >= nextGroupId) nextGroupId = gid + 1
+  const g: Group = {
+    id: gid,
+    name,
+    color: pickUnusedColor(groups.map((x) => x.color)), // a colour no other group has
+    mix: { gainDb: 0, pan: 0, mute: false, solo: false, rec: false },
+    inserts: [],
+    peakHold: 0,
+    vu: 0,
+    strip: null as unknown as Strip
+  }
+  g.strip = buildStrip(g, gid, name, true)
+  ;(g.strip.el.querySelector('.strip-head .n') as HTMLElement).textContent = `G${gid - GROUP_ID_BASE}`
+  g.strip.r.style.display = 'none' // a bus is not armed for recording
+  applyGroupColor(g)
+  groups.push(g)
+  return g
+}
+
+function removeGroup(id: number): void {
+  const i = groups.findIndex((g) => g.id === id)
+  if (i < 0) return
+  closeAllPlugWins() // the group's insert windows
+  for (const l of lanes) if (l.group === id) l.group = undefined
+  groups[i].strip.el.remove()
+  groups.splice(i, 1)
+  refreshSolo()
+  if (selectedId === id) selectLane(lanes.length ? lanes[0].id : null)
+  else renderDetail()
+}
+
+/** A group channel as the GPU path takes it: fader / pan (mute / solo applied) + its inserts. */
+function groupToMix(g: Group): MixGroup {
+  const soloMember = lanes.some((l) => l.group === g.id && l.mix.solo)
+  const audible = !g.mix.mute && (!anySolo || g.mix.solo || soloMember)
+  return { mix: { gain: audible ? dbToLin(g.mix.gainDb) : 0, pan: g.mix.pan }, inserts: g.inserts }
 }
 
 /** Peak-per-window envelope from decoded (pre-resample) channels, indexed by time. */
@@ -2526,15 +3633,38 @@ interface SzTrack {
   inserts: SzInsert[]
   /** v2: placed clips (v1 files have none → migrated to one full-length clip). */
   clips?: SzClip[]
+  /** Instrument lane: index into `midiTracks` of the track that feeds it (no clips are stored). */
+  instrumentOf?: number
+  /** Line-input lane (the input channel is `recIn`). */
+  live?: { monitor: boolean }
+  /** Stem name (absent = none). */
+  stem?: string
+  /** Output group id (absent = master). */
+  group?: number
+  /** Track colour `#rrggbb` (absent in older files: a palette colour by position). */
+  color?: string
+}
+interface SzGroup {
+  id: number
+  name: string
+  color?: string
+  mix: LaneMix
+  inserts: SzInsert[]
 }
 interface ProjectFile {
   version: number
+  /** Group channels (absent in older files). */
+  groups?: SzGroup[]
+  /** Stem name -> colour (absent in older files). */
+  stemColors?: Record<string, string>
   sampleRate: number
   bpm?: number
   timeSig?: { num: number; den: number }
   gridMode?: string
   sources?: SzSource[]
   master: { gainDb: number; inserts: SzInsert[] }
+  /** MIDI tracks (absent in older files). */
+  midiTracks?: SzMidiTrack[]
   view: { framesPerPixel: number; scrollFrames: number; playhead: number }
   tracks: SzTrack[]
 }
@@ -2623,20 +3753,27 @@ async function boot(): Promise<void> {
   try {
     const gpu = await initGpu()
     const label = `WebGPU ready · ${gpu.adapter.info?.vendor || 'adapter'} ${gpu.adapter.info?.architecture ?? ''}`.trim()
-    gpuStatus.textContent = label
-    gpuStatus.className = 'ok'
+    setGpuLamp('ok', label)
     console.log(`[gpu] ${label}`)
   } catch (err) {
     const msg = `WebGPU failed: ${(err as Error).message}`
     gpuStatus.textContent = msg
     gpuStatus.className = 'err'
+    setGpuLamp('err', msg)
     console.error(`[gpu] ${msg}`)
     return
   }
 
   const scheduler = new PlaybackScheduler(() => lanes.map(laneToSource))
+  scheduler.getGroups = () => groups.map(groupToMix)
   window.daw.onAudioStatus((s) => scheduler.onStatus(s))
   window.daw.onRecChunk((c) => scheduler.onRecChunk(c))
+  // live (line-input) path: its own small-block bus, fed by main's ~256-frame input batches
+  schedulerRef = scheduler
+  liveBusRef = scheduler.liveBus = new LiveBus(liveLanes, () => scheduler.masterBus.masterGain)
+  liveBusRef.latencyMs = readNum(LIVE_LAT_KEY, 0)
+  scheduler.recOffsetMs = readNum(REC_OFF_KEY, 0)
+  window.daw.onLiveIn((c) => liveBusRef?.feed(c, state.sampleRate))
   masterBusInserts = scheduler.masterBus.inserts // detail pane + strip rack edit this list
   masterRackEl = $('master-rack')
   renderStripRack('master') // 8 empty master insert slots
@@ -2691,6 +3828,7 @@ async function boot(): Promise<void> {
       gpuStatus.className = statusFlashSaved.cls
     }, 3200)
   }
+  notify = flashStatus
 
   const szClip = (c: Clip): SzClip => ({
     sourceId: c.sourceId,
@@ -2713,19 +3851,30 @@ async function boot(): Promise<void> {
       bpm: state.bpm,
       timeSig: { num: state.timeSigNum, den: state.timeSigDen },
       gridMode: state.gridMode,
-      sources: sourceList().map((s) => ({
-        id: s.id,
-        name: s.name,
-        path: s.path,
-        kind: s.kind,
-        toneSeconds: s.toneSeconds
-      })),
+      sources: sourceList()
+        .filter((s) => s.kind !== 'inst')
+        .map((s) => ({
+          id: s.id,
+          name: s.name,
+          path: s.path,
+          kind: s.kind as 'wav' | 'tone',
+          toneSeconds: s.toneSeconds
+        })),
       master: {
         gainDb: Number(masterEl.value),
         inserts: (masterBusInserts ?? [])
           .map(serializeInsert)
           .filter((x): x is SzInsert => x !== null)
       },
+      midiTracks: serializeMidi(),
+      stemColors: { ...stemColorTable },
+      groups: groups.map((g) => ({
+        id: g.id,
+        name: g.name,
+        color: g.color,
+        mix: { ...g.mix },
+        inserts: g.inserts.map(serializeInsert).filter((x): x is SzInsert => x !== null)
+      })),
       view: {
         framesPerPixel: state.framesPerPixel,
         scrollFrames: state.scrollFrames,
@@ -2737,7 +3886,12 @@ async function boot(): Promise<void> {
         recIn: { ...l.recIn },
         strip: { bypass: l.dsp.bypass, params: structuredClone(l.dsp.params) },
         inserts: l.inserts.map(serializeInsert).filter((x): x is SzInsert => x !== null),
-        clips: l.clips.map(szClip)
+        clips: l.inst ? [] : l.clips.map(szClip),
+        instrumentOf: l.inst ? midiTracks.findIndex((t) => t.id === l.inst?.midiTrackId) : undefined,
+        live: l.live ? { monitor: l.live.monitor } : undefined,
+        stem: l.stem ? l.stem : undefined,
+        group: l.group !== undefined && groupById(l.group) ? l.group : undefined,
+        color: l.color
       }))
     }
   }
@@ -2754,6 +3908,10 @@ async function boot(): Promise<void> {
       l.strip.el.remove()
     }
     lanes.length = 0
+    for (const g of groups) g.strip.el.remove()
+    groups.length = 0
+    nextGroupId = GROUP_ID_BASE + 1
+    stemColorTable = {}
     nextId = 1
     selectedId = null
     audioPick = null
@@ -2763,6 +3921,7 @@ async function boot(): Promise<void> {
     anySolo = false
     masterStripEl.classList.remove('selected')
     clearSourceRegistry()
+    clearMidi()
 
     const sr = Number(p.sampleRate) || state.sampleRate
     srSelect.value = String(sr)
@@ -2782,12 +3941,47 @@ async function boot(): Promise<void> {
       else if (ss.path) src = await importWavSource(ss.path, ss.name)
       if (src) srcMap.set(ss.id, src)
     }
+    restoreMidi(p.midiTracks) // before the track loop: instrument lanes read it
+    for (const [k, v] of Object.entries(p.stemColors ?? {})) {
+      const c = normalizeColor(v)
+      if (c && cleanStemName(k)) stemColorTable[cleanStemName(k)] = c
+    }
+    for (const sg of p.groups ?? []) {
+      const g = addGroup(cleanStemName(sg.name) || 'Group', Number(sg.id) > GROUP_ID_BASE ? Number(sg.id) : undefined)
+      const gc = normalizeColor(sg.color)
+      if (gc) {
+        g.color = gc
+        applyGroupColor(g)
+      }
+      if (sg.mix) {
+        g.mix.gainDb = Number(sg.mix.gainDb ?? 0)
+        g.mix.pan = Number(sg.mix.pan ?? 0)
+        g.mix.mute = !!sg.mix.mute
+        g.mix.solo = !!sg.mix.solo
+      }
+      for (const si of sg.inserts ?? []) {
+        const fx = deserializeInsert(si)
+        if (fx) g.inserts.push(fx)
+      }
+      g.strip.setGain(g.mix.gainDb)
+      g.strip.setPan(g.mix.pan)
+      g.strip.m.classList.toggle('on', g.mix.mute)
+      g.strip.s.classList.toggle('on', g.mix.solo)
+      renderStripRack(g.id)
+    }
     const v1 = !p.sources // pre-clip project: one full-length clip per track
 
     for (const t of p.tracks ?? []) {
-      const lane = addLane(t.title || 'Track')
+      const imt = t.instrumentOf !== undefined && t.instrumentOf >= 0 ? midiTracks[t.instrumentOf] : undefined
+      const lane = imt ? addInstrumentLane(imt) : addLane(t.title || 'Track')
 
-      if (v1) {
+      if (t.live) {
+        lane.live = { monitor: t.live.monitor !== false }
+        lane.el.classList.add('line')
+      }
+      if (imt) {
+        // clips come from the instrument render, nothing to rebuild
+      } else if (v1) {
         let src: AudioSource | null = null
         if (t.kind === 'tone') src = makeToneSource(t.toneSeconds ?? 6, t.title || 'Demo tone')
         else if (t.path) src = await importWavSource(t.path, t.title)
@@ -2827,6 +4021,16 @@ async function boot(): Promise<void> {
         lane.mix.rec = !!t.mix.rec
       }
       if (t.recIn) lane.recIn = { ch: Math.max(0, Number(t.recIn.ch) | 0), stereo: !!t.recIn.stereo }
+      if (t.stem) lane.stem = cleanStemName(t.stem)
+      if (t.group !== undefined && groupById(t.group)) lane.group = t.group
+      {
+        const tc = normalizeColor(t.color)
+        if (tc) {
+          lane.color = tc
+          applyLaneColor(lane)
+        }
+      }
+      if (lane.live) setLaneSub(lane, liveSub(lane))
       applyStripParams(lane.dsp, t.strip)
       lane.inserts.length = 0
       for (const si of t.inserts ?? []) {
@@ -2934,34 +4138,888 @@ async function boot(): Promise<void> {
   $('proj-saveas').addEventListener('click', () => void doSaveAs())
   $('proj-open').addEventListener('click', () => void doOpen())
 
-  // ---- add-track wizard ----------------------------------------------------
-  const wizard = $('wizard')
-  const openWizard = (): void => {
-    wizard.hidden = false
+  /**
+   * Import a DAWproject (Cubase 14+: File > Export > DAWproject). main unzips it and
+   * extracts the WAVs; here the XML becomes an ordinary project snapshot that goes
+   * through restoreProject, so everything downstream (save, undo reset, VRAM upload)
+   * behaves as for a normal Open.
+   */
+  /** A note track whose notes are mostly on MIDI channel 10 (index 9) is a drum part. */
+  const isDrumTrack = (clips: { notes: { channel: number }[] }[]): boolean => {
+    const all = clips.flatMap((c) => c.notes)
+    return all.length > 0 && all.filter((n) => n.channel === 9).length / all.length > 0.8
   }
-  const closeWizard = (): void => {
-    wizard.hidden = true
-  }
-  $('add-track').addEventListener('click', openWizard)
-  $('wiz-cancel').addEventListener('click', closeWizard)
-  wizard.addEventListener('click', (e) => {
-    if (e.target === wizard) closeWizard()
-  })
-  window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !wizard.hidden) {
-      closeWizard()
-      return
+  async function doImportDawproject(
+    explicitPath?: string
+  ): Promise<{ tracks: number; midiTracks: number; clips: number; warnings: string[] }> {
+    const none = { tracks: 0, midiTracks: 0, clips: 0, warnings: [] as string[] }
+    try {
+      flashStatus('importing DAWproject…')
+      const res = await window.daw.dawprojectOpen(explicitPath)
+      if (!res) return none
+      if (!res.ok) throw new Error(res.error)
+      const imp = parseDawproject(res.xml)
+      const sr = state.sampleRate
+      const warnings = [...imp.warnings]
+      for (const sk of res.skipped) warnings.push(`${sk}: only WAV audio is supported, skipped`)
+
+      // one source per distinct audio file
+      const sources: NonNullable<ProjectFile['sources']> = []
+      const srcId = new Map<string, number>()
+      const sourceFor = (file: string): number | null => {
+        const have = srcId.get(file)
+        if (have !== undefined) return have
+        const path = res.files[file]
+        if (!path) {
+          warnings.push(`${file}: audio file missing or not WAV, clip skipped`)
+          return null
+        }
+        const id = sources.length + 1
+        // main prefixes extracted files with an index to keep names unique; it is not part of the name
+        sources.push({ id, name: trackNameFromPath(path).replace(/^\d{3}_/, ''), path, kind: 'wav' })
+        srcId.set(file, id)
+        return id
+      }
+
+      const tracks: SzTrack[] = []
+      const midi: SzMidiTrack[] = []
+      for (const t of imp.tracks) {
+        const mix = { gainDb: Math.max(-100, Math.min(12, t.gainDb)), pan: t.pan, mute: t.mute, solo: t.solo, rec: false }
+        const strip = { bypass: false, params: defaultStripParams() }
+        if (t.kind === 'notes') {
+          // MIDI → instrument lane (simple GPU synth); the notes keep their MIDI identity
+          midi.push({
+            name: t.name,
+            channel: Math.min(15, midi.length),
+            mute: false, // the lane's mix carries mute / solo
+            solo: false,
+            outId: null,
+            inId: null,
+            instrument: isDrumTrack(t.midiClips)
+              ? { kind: 'drums', params: defaultDrumParams() }
+              : { kind: 'synth', params: defaultSynthParams() },
+            clips: t.midiClips.map((c) => ({
+              name: c.name,
+              start: c.startBeats,
+              length: Math.max(0.25, c.lengthBeats),
+              notes: c.notes.map((n) => ({ start: n.startBeats - c.startBeats, dur: n.durBeats, key: n.key, vel: n.vel }))
+            }))
+          })
+          tracks.push({ title: t.name, mix, strip, inserts: [], clips: [], instrumentOf: midi.length - 1 })
+          continue
+        }
+        const clips: SzClip[] = []
+        for (const c of t.audioClips) {
+          const sid = sourceFor(c.file)
+          if (sid === null) continue
+          const len = Math.max(1, Math.round(c.lengthSec * sr))
+          clips.push({
+            sourceId: sid,
+            name: c.name,
+            startFrame: Math.max(0, Math.round(c.startSec * sr)),
+            srcOffset: Math.max(0, Math.round(c.srcOffsetSec * sr)),
+            lengthFrames: len,
+            fadeIn: Math.min(len, Math.round(c.fadeInSec * sr)),
+            fadeOut: Math.min(len, Math.round(c.fadeOutSec * sr)),
+            fadeInShape: 'eqpow',
+            fadeOutShape: 'eqpow',
+            gainDb: 0
+          })
+        }
+        tracks.push({ title: t.name, mix, strip, inserts: [], clips })
+      }
+
+      const snapshot: ProjectFile = {
+        version: 2,
+        sampleRate: sr,
+        bpm: imp.bpm,
+        timeSig: imp.timeSig,
+        gridMode: state.gridMode,
+        sources,
+        master: { gainDb: Math.max(-100, Math.min(12, imp.masterGainDb)), inserts: [] },
+        midiTracks: midi,
+        view: { framesPerPixel: 0, scrollFrames: 0, playhead: 0 },
+        tracks
+      }
+      await restoreProject(snapshot)
+      const nClips = tracks.reduce((a, t) => a + (t.clips?.length ?? 0), 0)
+      console.log('[dawproject]', imp.app, `${tracks.length} audio / ${midi.length} MIDI tracks, ${nClips} clips`, warnings)
+      for (const w of warnings) console.warn('[dawproject] ', w)
+      flashStatus(
+        `DAWproject: ${tracks.length} audio + ${midi.length} MIDI tracks, ${nClips} clips` +
+          (warnings.length ? ` · ${warnings.length} note(s) in console` : '')
+      )
+      return { tracks: tracks.length, midiTracks: midi.length, clips: nClips, warnings }
+    } catch (err) {
+      console.error('[dawproject] import failed', err)
+      flashStatus(`DAWproject import failed: ${(err as Error).message}`, true)
+      if (explicitPath) throw err // MCP callers want the error, the button just flashes it
+      return none
     }
-    // Ctrl/⌘+S saves the project regardless of focus.
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) {
-      e.preventDefault()
-      void doSave()
-      return
+  }
+  $('proj-import-dp').addEventListener('click', () => void doImportDawproject())
+
+  /**
+   * Export the project as a DAWproject. Audio sources are the original WAVs where they
+   * exist (full quality, original rate); GPU-generated sources (demo tones) are rendered to
+   * a float WAV. Instrument lanes export their MIDI — the receiving DAW supplies the sound.
+   * Not exported: channel strip, inserts, per-clip gain, synth parameters.
+   */
+  async function doExportDawproject(explicitPath?: string): Promise<{ audioTracks: number; noteTracks: number; files: number; path?: string }> {
+    const none = { audioTracks: 0, noteTracks: 0, files: 0 }
+    try {
+      if (lanes.length === 0) throw new Error('nothing to export')
+      flashStatus('exporting DAWproject…')
+      const sr = state.sampleRate
+      const files: { name: string; path?: string; bytes?: ArrayBuffer }[] = []
+      const sources: ExpAudioSource[] = []
+      const fileOf = new Map<number, ExpAudioSource>()
+      const sanitize = (s: string): string => s.replace(/[^\w .()-]+/g, '_').slice(0, 60) || 'audio'
+
+      const sourceEntry = async (srcId: number): Promise<ExpAudioSource | null> => {
+        const have = fileOf.get(srcId)
+        if (have) return have
+        const src = getSource(srcId)
+        if (!src || src.kind === 'inst') return null
+        const name = `audio/${String(files.length + 1).padStart(3, '0')}_${sanitize(src.name)}.wav`
+        let entry: ExpAudioSource
+        if (src.path) {
+          const info = await window.daw.wavInfo(src.path)
+          if (!info.ok) throw new Error(`${src.name}: ${info.error}`)
+          files.push({ name, path: src.path })
+          entry = { id: srcId, file: name, sampleRate: info.sampleRate, channels: Math.min(info.channels, 2), durationSec: info.frames / info.sampleRate }
+        } else {
+          const planar = await src.gpu.readChannels()
+          files.push({ name, bytes: encodeWavFloat32(planar, sr) })
+          entry = { id: srcId, file: name, sampleRate: sr, channels: planar.length, durationSec: src.gpu.totalFrames / sr }
+        }
+        sources.push(entry)
+        fileOf.set(srcId, entry)
+        return entry
+      }
+
+      const tracks: ExpTrack[] = []
+      for (const l of lanes) {
+        const title = (l.el.querySelector('.lane-title') as HTMLElement).textContent ?? 'Track'
+        const base = { name: title, gainDb: l.mix.gainDb, pan: l.mix.pan, mute: l.mix.mute, solo: l.mix.solo, channels: 2 }
+        const mt = l.inst ? midiTrackById(l.inst.midiTrackId) : undefined
+        if (l.inst) {
+          tracks.push({
+            ...base,
+            kind: 'notes',
+            midiChannel: mt?.channel ?? 0,
+            audioClips: [],
+            midiClips: (mt?.clips ?? []).map((c) => ({
+              name: c.name,
+              startBeats: c.start,
+              lengthBeats: c.length,
+              notes: c.notes.map((n) => ({ start: n.start, dur: n.dur, key: n.key, vel: n.vel }))
+            }))
+          })
+          continue
+        }
+        const audioClips = []
+        for (const c of l.clips) {
+          const e = await sourceEntry(c.sourceId)
+          if (!e) continue
+          audioClips.push({
+            sourceId: c.sourceId,
+            name: c.name,
+            startSec: c.startFrame / sr,
+            offsetSec: c.srcOffset / sr,
+            lengthSec: c.lengthFrames / sr,
+            fadeInSec: c.fadeIn / sr,
+            fadeOutSec: c.fadeOut / sr
+          })
+        }
+        const ch = audioClips.length ? (fileOf.get(audioClips[0].sourceId)?.channels ?? 2) : 2
+        tracks.push({ ...base, kind: 'audio', channels: ch, audioClips, midiClips: [] })
+      }
+
+      const xml = buildDawprojectXml({
+        bpm: state.bpm,
+        timeSig: { num: state.timeSigNum, den: state.timeSigDen },
+        masterGainDb: Number(masterEl.value),
+        tracks,
+        sources
+      })
+      const res = await window.daw.dawprojectSave(
+        { projectXml: xml, metadataXml: buildMetadataXml('Awaker project'), defaultName: 'project', files },
+        explicitPath
+      )
+      if (!res) return none
+      if (!res.ok) throw new Error(res.error)
+      const out = {
+        audioTracks: tracks.filter((t) => t.kind === 'audio').length,
+        noteTracks: tracks.filter((t) => t.kind === 'notes').length,
+        files: files.length,
+        path: res.path
+      }
+      flashStatus(`DAWproject exported: ${out.audioTracks} audio + ${out.noteTracks} MIDI tracks, ${out.files} files`)
+      return out
+    } catch (err) {
+      console.error('[dawproject] export failed', err)
+      flashStatus(`DAWproject export failed: ${(err as Error).message}`, true)
+      if (explicitPath) throw err
+      return none
+    }
+  }
+  $('proj-export-dp').addEventListener('click', () => void doExportDawproject())
+
+  /** Import a Standard MIDI File: each track with notes becomes an instrument track. */
+  async function doImportMidi(explicitPath?: string): Promise<{ tracks: number; notes: number; bpm: number }> {
+    const none = { tracks: 0, notes: 0, bpm: state.bpm }
+    try {
+      const res = await window.daw.midiOpen(explicitPath)
+      if (!res) return none
+      if (!res.ok) throw new Error(res.error)
+      const smf = parseSmf(new Uint8Array(res.bytes))
+      if (smf.tracks.length === 0) throw new Error('no notes in this MIDI file')
+      // an empty project takes the file's tempo / meter; otherwise notes keep their beat positions
+      if (lanes.length === 0) update({ bpm: Math.round(smf.bpm * 100) / 100, timeSigNum: smf.timeSig.num, timeSigDen: smf.timeSig.den })
+      let notes = 0
+      for (const t of smf.tracks) {
+        const mt = addMidiTrack(t.name, t.channel)
+        if (t.channel === 9) mt.instrument = { kind: 'drums', params: defaultDrumParams() } // GM channel 10
+        const endBeats = t.notes.reduce((m, n) => Math.max(m, (n.tick + n.dur) / smf.ppq), 0)
+        const clip = addMidiClip(mt, 0, Math.max(1, Math.ceil(endBeats)), t.name)
+        for (const n of t.notes) addNote(clip, n.tick / smf.ppq, n.dur / smf.ppq, n.key, n.vel)
+        notes += t.notes.length
+        addInstrumentLane(mt)
+      }
+      refreshTotals()
+      fitToProject()
+      flashStatus(`MIDI: ${smf.tracks.length} tracks, ${notes} notes` + (smf.tempoChanges > 1 ? ' (tempo changes ignored)' : ''))
+      return { tracks: smf.tracks.length, notes, bpm: state.bpm }
+    } catch (err) {
+      console.error('[midi] import failed', err)
+      flashStatus(`MIDI import failed: ${(err as Error).message}`, true)
+      if (explicitPath) throw err
+      return none
+    }
+  }
+
+  // ---- stems ----------------------------------------------------------------------------------
+  const laneTitleOf = (l: Lane): string => (l.el.querySelector('.lane-title') as HTMLElement | null)?.textContent ?? `Track ${l.id}`
+  const stemTracks = (): { id: number; title: string; stem: string }[] =>
+    lanes.map((l) => ({ id: l.id, title: laneTitleOf(l), stem: l.stem ?? '' }))
+
+  const groupSummary = (g: Group): unknown => ({
+    id: g.id,
+    name: g.name,
+    mix: { ...g.mix },
+    color: g.color,
+    tracks: lanes.filter((l) => l.group === g.id).map((l) => ({ id: l.id, title: laneTitleOf(l) })),
+    inserts: g.inserts.length
+  })
+  const listGroups = (): unknown => groups.map(groupSummary)
+
+  function listStems(): { stems: { name: string; trackIds: number[]; tracks: string[] }[]; unassigned: { id: number; title: string }[] } {
+    const all = stemTracks()
+    return {
+      stems: groupStems(all).map((g) => ({ name: g.name, color: stemColorTable[g.name] ?? null, trackIds: g.trackIds, tracks: g.trackTitles })),
+      unassigned: all.filter((t) => !t.stem.trim()).map((t) => ({ id: t.id, title: t.title }))
+    }
+  }
+
+  function setStem(trackId: number, stem: string): { id: number; title: string; stem: string; color: string | undefined } {
+    const lane = laneById(trackId)
+    if (!lane) throw new Error(`no track ${trackId}`)
+    lane.stem = cleanStemName(stem)
+    alignStem(lane) // the stem's tracks share one colour
+    if (selectedId === lane.id) renderDetail()
+    return { id: lane.id, title: laneTitleOf(lane), stem: lane.stem, color: lane.color }
+  }
+
+  interface StemRequest {
+    /** Stem names to export (default: all). */
+    stems?: string[]
+    /** One file per track instead of per stem (a channel batch export). */
+    perTrack?: boolean
+    /** Also export every group channel (default: yes when no stem names are given). */
+    includeGroups?: boolean
+    folder?: string
+    /** Check that the stems add up to the mix of the same tracks (default true when there are 2+ stems). */
+    verify?: boolean
+    startSeconds?: number
+    seconds?: number
+    settings?: Partial<StemExportSettings>
+  }
+  interface StemFile {
+    stem: string
+    /** true: the output of a group channel (bus), not a set of tracks summed straight to the master. */
+    group?: boolean
+    tracks: string[]
+    path: string
+    frames: number
+    sampleRate: number
+    bitDepth: number
+    peakDb: number
+    clamped: number
+  }
+
+  /**
+   * Render each stem offline through the GPU path (strip + inserts + fader + pan of ITS tracks only), convert to the
+   * requested rate / bit depth and write a WAV per stem. The sum of the stems is compared with a direct render of
+   * the same tracks: that is the proof they add up.
+   */
+  async function exportStems(req: StemRequest = {}): Promise<{
+    dir: string
+    settings: StemExportSettings
+    files: StemFile[]
+    skipped: string[]
+    verify?: { maxAbsDiff: number; snrDb: number | null; ok: boolean }
+  }> {
+    if (state.playing || scheduler.recording) throw new Error('stop the transport first')
+    const settings = sanitizeStemExport(req.settings, getStemDefaults())
+    const sr = state.sampleRate
+    const outRate = settings.sampleRate || sr
+    const grps = groups
+    // what gets exported: stems by name (or one per track), plus the group channels (their bus output)
+    type Item = StemGroup & { busId?: number }
+    let items: Item[] = req.perTrack
+      ? lanes
+          .filter((l) => resolveLaneClips(l).length > 0)
+          .map((l) => ({ name: laneTitleOf(l), trackIds: [l.id], trackTitles: [laneTitleOf(l)] }))
+      : groupStems(stemTracks())
+    const wantNames = req.stems && req.stems.length ? new Set(req.stems.map(cleanStemName)) : null
+    if (req.includeGroups ?? !wantNames) {
+      for (const g of grps) {
+        const ids = lanes.filter((l) => l.group === g.id).map((l) => l.id)
+        if (ids.length) items.push({ name: g.name, trackIds: ids, trackTitles: ids.map((i) => laneTitleOf(laneById(i)!)), busId: g.id })
+      }
+    }
+    if (wantNames) {
+      // a name that is both a stem and a group exports both; unknown names are an error
+      const known = new Set([...items.map((g) => g.name), ...grps.map((g) => g.name)])
+      for (const w of wantNames) if (!known.has(w)) throw new Error(`unknown stem / group: ${w} (known: ${[...known].join(', ') || 'none'})`)
+      for (const g of grps) {
+        if (!wantNames.has(g.name) || items.some((x) => x.busId === g.id)) continue
+        const ids = lanes.filter((l) => l.group === g.id).map((l) => l.id)
+        if (ids.length) items.push({ name: g.name, trackIds: ids, trackTitles: ids.map((i) => laneTitleOf(laneById(i)!)), busId: g.id })
+      }
+      items = items.filter((g) => wantNames.has(g.name))
+    }
+    // a group named like a stem, with the same tracks, IS that stem: export it once (as the bus output)
+    const sameSet = (x: number[], y: number[]): boolean => x.length === y.length && x.every((v) => y.includes(v))
+    items = items.filter(
+      (it) => it.busId !== undefined || !items.some((o) => o.busId !== undefined && o.name === it.name && sameSet(o.trackIds, it.trackIds))
+    )
+    if (!items.length) throw new Error('nothing to export: give tracks a Stem name (Track detail → Stem), route tracks into a group, or use perTrack')
+
+    const opened = await window.daw.exportOpenDir(req.folder ?? '', 'Mix')
+    if (!opened.ok) throw new Error(`export folder: ${opened.error}`)
+    const from = Math.round(Math.max(0, req.startSeconds ?? 0) * sr)
+    const frames = req.seconds != null && req.seconds > 0 ? Math.round(req.seconds * sr) : null
+    const toSource = (l: Lane): MixSource => {
+      const s = laneToSource(l)
+      return { ...s, strip: settings.process === 'dry' ? undefined : s.strip, inserts: settings.process === 'full' ? s.inserts : [] }
+    }
+    const used = new Set<string>()
+    const files: StemFile[] = []
+    const skipped: string[] = []
+    let sum: Float32Array | null = null
+    const members: Lane[] = []
+    const db = (x: number): number => (x > 0 ? 20 * Math.log10(x) : -Infinity)
+
+    for (let gi = 0; gi < items.length; gi++) {
+      const g = items[gi]
+      const ls = g.trackIds.map((id) => laneById(id)).filter((l): l is Lane => !!l && resolveLaneClips(l).length > 0)
+      if (!ls.length) {
+        skipped.push(g.name)
+        continue
+      }
+      flashStatus(`stem ${gi + 1}/${items.length}: ${g.name}…`)
+      // a group channel exports as the OUTPUT of the bus: its tracks, then the group inserts, fader and pan
+      const bus = g.busId !== undefined ? groupById(g.busId) : undefined
+      const busMix: MixGroup | undefined = bus
+        ? { ...groupToMix(bus), inserts: settings.process === 'full' ? bus.inserts : [] }
+        : undefined
+      const r = await scheduler.renderOffline(
+        ls.map((l) => (busMix ? { ...toSource(l), group: 0 } : { ...toSource(l), group: undefined })),
+        {
+          startFrame: from,
+          frames,
+          tailSeconds: settings.tailSeconds,
+          masterChain: settings.masterChain,
+          groups: busMix ? [busMix] : []
+        }
+      )
+      if (!busMix) {
+        // the sum check covers the stems by name / per track; a bus output carries its own processing
+        members.push(...ls)
+        if (!sum) sum = new Float32Array(r.audio.length)
+        for (let i = 0; i < r.audio.length && i < sum.length; i++) sum[i] += r.audio[i]
+      }
+      const data = outRate === sr ? r.audio : resampleInterleaved(r.audio, 2, sr, outRate)
+      const enc = encodeWavPcm(data, 2, outRate, settings.bitDepth)
+      const name = stemFileName('Mix', g.name, outRate, settings.bitDepth, used)
+      const w = await window.daw.exportWriteFile(opened.dir, name, enc.bytes)
+      if (!w.ok) throw new Error(`write ${name}: ${w.error}`)
+      files.push({
+        stem: g.name,
+        ...(busMix ? { group: true } : {}),
+        tracks: ls.map(laneTitleOf),
+        path: w.path,
+        frames: Math.floor(data.length / 2),
+        sampleRate: outRate,
+        bitDepth: settings.bitDepth,
+        peakDb: Math.round(db(Math.max(r.peak[0], r.peak[1])) * 100) / 100,
+        clamped: enc.clamped
+      })
+    }
+
+    let verify: { maxAbsDiff: number; snrDb: number | null; ok: boolean } | undefined
+    const doVerify = req.verify ?? files.length > 1
+    if (doVerify && sum && members.length > 0) {
+      flashStatus('stems: checking they add up…')
+      const ref = await scheduler.renderOffline(members.map(toSource), {
+        startFrame: from,
+        frames,
+        tailSeconds: settings.tailSeconds,
+        masterChain: settings.masterChain
+      })
+      const t = nullTest(sum, ref.audio)
+      verify = { maxAbsDiff: t.maxAbsDiff, snrDb: Number.isFinite(t.snrDb) ? Math.round(t.snrDb * 10) / 10 : null, ok: t.maxAbsDiff < 1e-4 }
+    }
+    flashStatus(`stems exported: ${files.length} file(s) → ${opened.dir}`)
+    return { dir: opened.dir, settings, files, skipped, ...(verify ? { verify } : {}) }
+  }
+
+  /**
+   * Average spectrum of the whole mix against the AI-mix target. `breakdown` also measures every part on its own
+   * (each group channel, each stem that is not in a group, and the rest) so the report can say which part carries
+   * the energy of a region and how much it would have to move. Renders are streamed through the analyser: no
+   * copy of the audio is kept.
+   */
+  async function analyzeSpectrum(req: { scope?: string; startSeconds?: number; seconds?: number }): Promise<unknown> {
+    if (state.playing || scheduler.recording) throw new Error('stop the transport first')
+    const target = getMixTarget()
+    if (!target) throw new Error('no target yet: call mix_target with a genre first (the AI Mix button sets one)')
+    const sr = state.sampleRate
+    const from = Math.round(Math.max(0, req.startSeconds ?? 0) * sr)
+    const frames = req.seconds != null && req.seconds > 0 ? Math.round(req.seconds * sr) : null
+    const expected = frames ?? Math.max(0, state.totalFrames - from)
+    if (expected <= 0) throw new Error('nothing to analyse: the project has no audio')
+    const breakdown = req.scope === 'breakdown'
+    const t0 = performance.now()
+
+    flashStatus('spectrum: the mix…')
+    const accM = new SpectrumAccumulator(sr, expected)
+    const m = await scheduler.renderMaster({ startFrame: from, frames, onBlock: (b, n) => accM.pushInterleaved(b, n) })
+    const measured = accM.finish()
+    if (measured.usedFrames === 0) throw new Error('the mix is silent (everything muted, or no audio in this range)')
+
+    let parts: BucketLevels[] | undefined
+    if (breakdown) {
+      type Bucket = { name: string; owner: BucketLevels['owner']; ls: Lane[]; bus?: Group }
+      const audible = lanes.filter((l) => resolveLaneClips(l).length > 0)
+      const buckets: Bucket[] = []
+      for (const g of groups) {
+        const ls = audible.filter((l) => l.group === g.id)
+        if (ls.length) buckets.push({ name: g.name, owner: { kind: 'group', id: g.id }, ls, bus: g })
+      }
+      const rest = audible.filter((l) => l.group === undefined || !groupById(l.group))
+      for (const st of groupStems(rest.map((l) => ({ id: l.id, title: laneTitleOf(l), stem: l.stem ?? '' })))) {
+        buckets.push({ name: st.name, owner: { kind: 'stem', tracks: st.trackIds }, ls: st.trackIds.map((id) => laneById(id)).filter((l): l is Lane => !!l) })
+      }
+      const loose = rest.filter((l) => !(l.stem ?? '').trim())
+      if (loose.length > 0 && loose.length <= 32) {
+        // not in a group or a stem: each track is its own part, so a correction can go to the track that causes it
+        for (const l of loose) buckets.push({ name: laneTitleOf(l), owner: { kind: 'other', tracks: [l.id] }, ls: [l] })
+      } else if (loose.length > 0) {
+        buckets.push({ name: 'Other', owner: { kind: 'other', tracks: loose.map((l) => l.id) }, ls: loose })
+      }
+
+      parts = []
+      for (let i = 0; i < buckets.length; i++) {
+        const bk = buckets[i]
+        flashStatus(`spectrum: ${bk.name} (${i + 1}/${buckets.length})…`)
+        const acc = new SpectrumAccumulator(sr, expected)
+        const bus = bk.bus ? groupToMix(bk.bus) : undefined
+        await scheduler.renderOffline(
+          bk.ls.map((l) => ({ ...laneToSource(l), group: bus ? 0 : undefined })),
+          { startFrame: from, frames, tailSeconds: 0, masterChain: false, groups: bus ? [bus] : [], keepAudio: false, onBlock: (b, n) => acc.pushInterleaved(b, n) }
+        )
+        const sp = acc.finish()
+        if (sp.usedFrames > 0) parts.push({ name: bk.name, owner: bk.owner, levelDb: sp.levelDb })
+      }
+    }
+    flashStatus('spectrum: done')
+    const db = (x: number): number => (x > 0 ? Math.round(20 * Math.log10(x) * 10) / 10 : -200)
+    return {
+      ...buildReport(measured, target, parts),
+      scope: breakdown ? 'breakdown' : 'master',
+      masterPeakDb: db(Math.max(m.peak[0], m.peak[1])),
+      parts: parts?.map((p) => ({ name: p.name, owner: p.owner })),
+      renderSeconds: Math.round((performance.now() - t0) / 100) / 10
+    }
+  }
+
+  /**
+   * Per-track level as it leaves the channel (strip + inserts + fader + pan, before any group / master): the RMS
+   * of the playing stretches, the peak, the crest and how far the loudest moment sticks out — and the trim that
+   * would bring the RMS to `targetDb`. Each track is rendered on its own and streamed through the meter.
+   */
+  async function trackLevels(req: { tracks?: number[]; targetDb?: number; startSeconds?: number; seconds?: number }): Promise<unknown> {
+    if (state.playing || scheduler.recording) throw new Error('stop the transport first')
+    const sr = state.sampleRate
+    const target = req.targetDb !== undefined && Number.isFinite(req.targetDb) ? Math.max(-60, Math.min(0, req.targetDb)) : -18
+    const from = Math.round(Math.max(0, req.startSeconds ?? 0) * sr)
+    const frames = req.seconds != null && req.seconds > 0 ? Math.round(req.seconds * sr) : null
+    const want = req.tracks && req.tracks.length ? new Set(req.tracks) : null
+    const ls = lanes.filter((l) => resolveLaneClips(l).length > 0 && (!want || want.has(l.id)))
+    if (!ls.length) throw new Error('no tracks with audio' + (want ? ' among the given ids' : ''))
+    const t0 = performance.now()
+    const out: unknown[] = []
+    for (let i = 0; i < ls.length; i++) {
+      const l = ls[i]
+      flashStatus(`levels: ${laneTitleOf(l)} (${i + 1}/${ls.length})…`)
+      const meter = new LevelMeter(sr)
+      await scheduler.renderOffline([{ ...laneToSource(l), group: undefined }], {
+        startFrame: from,
+        frames,
+        tailSeconds: 0,
+        masterChain: false,
+        groups: [],
+        keepAudio: false,
+        onBlock: (b, n) => meter.pushInterleaved(b, n)
+      })
+      const st = meter.finish()
+      const p = l.dsp.params
+      out.push({
+        id: l.id,
+        title: laneTitleOf(l),
+        ...(st ?? { silent: true }),
+        faderDb: l.mix.gainDb,
+        muted: l.mix.mute,
+        trimDb: p.trimDb,
+        comp: { on: p.comp.on, threshDb: p.comp.threshDb, ratio: p.comp.ratio, attackMs: p.comp.attackMs, releaseMs: p.comp.releaseMs, makeupDb: p.comp.makeupDb },
+        ...(st ? { suggestTrimDb: suggestTrimDb(p.trimDb, st.rmsDb, target) } : {})
+      })
+    }
+    flashStatus('levels: done')
+    return { targetDb: target, tracks: out, renderSeconds: Math.round((performance.now() - t0) / 100) / 10 }
+  }
+
+  /**
+   * The whole mix as one WAV: the same render as a bounce (strips, inserts, groups, master chain + fader), then
+   * the Options → Export rate / bit depth. Returns where it went and what was measured.
+   */
+  async function exportMixdown(req: { folder?: string; file?: { dir: string; name: string }; settings?: Record<string, unknown> } = {}): Promise<{
+    path: string
+    seconds: number
+    sampleRate: number
+    bitDepth: number
+    peakDb: number
+    rmsDb: number
+    lufsIntegrated: number | null
+    clippedFrames: number
+    clamped: number
+    renderSeconds: number
+  }> {
+    if (state.playing || scheduler.recording) throw new Error('stop the transport first')
+    if (!lanes.some((l) => resolveLaneClips(l).length > 0)) throw new Error('nothing to export: the project has no audio')
+    const settings = sanitizeStemExport(req.settings, getStemDefaults())
+    const sr = state.sampleRate
+    const outRate = settings.sampleRate || sr
+    // a file the person named (File → Export → Mixdown…), or a folder + a generated name (MCP)
+    let target = req.file
+    if (!target) {
+      const opened = await window.daw.exportOpenDir(req.folder ?? '', 'Mix')
+      if (!opened.ok) throw new Error(`export folder: ${opened.error}`)
+      target = { dir: opened.dir, name: stemFileName('Mix', 'Mixdown', outRate, settings.bitDepth, new Set()) }
+    }
+    flashStatus('mixdown: rendering…')
+    const r = await scheduler.bounce(0, null, settings.tailSeconds, true)
+    if (!r.audio) throw new Error('the render came back empty')
+    flashStatus('mixdown: writing…')
+    const data = outRate === sr ? r.audio : resampleInterleaved(r.audio, 2, sr, outRate)
+    const enc = encodeWavPcm(data, 2, outRate, settings.bitDepth)
+    const w = await window.daw.exportWriteFile(target.dir, target.name, enc.bytes)
+    if (!w.ok) throw new Error(`write ${target.name}: ${w.error}`)
+    const r1 = (x: number): number => Math.round(x * 10) / 10
+    return {
+      path: w.path,
+      seconds: r1(r.seconds),
+      sampleRate: outRate,
+      bitDepth: settings.bitDepth,
+      peakDb: r1(Math.max(r.peakDb[0], r.peakDb[1])),
+      rmsDb: r1(Math.max(r.rmsDb[0], r.rmsDb[1])),
+      lufsIntegrated: Number.isFinite(r.lufsIntegrated) ? r1(r.lufsIntegrated) : null,
+      clippedFrames: r.clippedFrames,
+      clamped: enc.clamped,
+      renderSeconds: r1(r.renderMs / 1000)
+    }
+  }
+
+  /** Each group channel's own output peak over the whole song (its tracks, then the group inserts and fader). */
+  async function groupOutputPeaks(): Promise<{ id: number; name: string; peakDb: number }[]> {
+    if (state.playing || scheduler.recording) throw new Error('stop the transport first')
+    const out: { id: number; name: string; peakDb: number }[] = []
+    for (const g of groups) {
+      const ls = lanes.filter((l) => l.group === g.id && resolveLaneClips(l).length > 0)
+      if (!ls.length) continue
+      const r = await scheduler.renderOffline(
+        ls.map((l) => ({ ...laneToSource(l), group: 0 })),
+        { startFrame: 0, frames: null, tailSeconds: 0, masterChain: false, groups: [groupToMix(g)], keepAudio: false }
+      )
+      const pk = Math.max(r.peak[0], r.peak[1])
+      out.push({ id: g.id, name: g.name, peakDb: pk > 0 ? Math.round(20 * Math.log10(pk) * 10) / 10 : -Infinity })
+    }
+    return out
+  }
+
+  /** File → Export → Mixdown…: pick a folder, write the mix, report what it measured. */
+  async function doExportMixdownUi(): Promise<void> {
+    try {
+      if (!lanes.some((l) => resolveLaneClips(l).length > 0)) {
+        flashStatus('nothing to export: the project has no audio', true)
+        return
+      }
+      // 1) format (bit depth / sample rate / tail; the Options values are the start), 2) the file name
+      const defaults = getStemDefaults()
+      const choice = await askMixdownFormat(defaults, state.sampleRate)
+      if (!choice) return
+      const rate = (choice.sampleRate || state.sampleRate) / 1000
+      const target = await window.daw.exportSaveWav(`Mixdown_${rate}k_${choice.bitDepth === 32 ? '32f' : choice.bitDepth}.wav`)
+      if (!target) return
+      const r = await exportMixdown({ file: target, settings: { ...choice } })
+      const lufs = r.lufsIntegrated === null ? '' : ` · ${r.lufsIntegrated} LUFS`
+      const warn = r.clippedFrames > 0 || r.clamped > 0 ? ` · ${r.clippedFrames} clipped frames (lower the master fader)` : ''
+      flashStatus(`mixdown written: peak ${r.peakDb} dB${lufs}${warn} → ${r.path}`, r.clippedFrames > 0 || r.clamped > 0)
+    } catch (err) {
+      flashStatus(`mixdown failed: ${(err as Error).message}`, true)
+    }
+  }
+  $('proj-export-mixdown').addEventListener('click', () => void doExportMixdownUi())
+
+  /** File → Export → Stems…: pick a folder, run with the Options defaults, report. */
+  async function doExportStemsUi(): Promise<void> {
+    try {
+      if (groupStems(stemTracks()).length === 0 && !lanes.some((l) => l.group !== undefined && groupById(l.group))) {
+        flashStatus('nothing to export: type a Stem name on tracks (left pane) or route tracks into a group', true)
+        return
+      }
+      const folder = await window.daw.exportPickDir()
+      if (!folder) return
+      const r = await exportStems({ folder })
+      const v = r.verify ? ` · sum check ${r.verify.ok ? 'OK' : 'MISMATCH'}` : ''
+      const clipped = r.files.reduce((n, f) => n + f.clamped, 0)
+      const warn = clipped > 0 ? ` · ${clipped} samples clipped (use 32-bit float, or lower the faders)` : ''
+      flashStatus(`stems exported: ${r.files.length} file(s)${v}${warn} → ${r.dir}`, (r.verify ? !r.verify.ok : false) || clipped > 0)
+    } catch (err) {
+      flashStatus(`stem export failed: ${(err as Error).message}`, true)
+    }
+  }
+  $('proj-export-stems').addEventListener('click', () => void doExportStemsUi())
+  $('add-group').addEventListener('click', () => {
+    const g = addGroup(`Group ${groups.length + 1}`)
+    selectLane(g.id)
+    flashStatus(`${g.name} added: pick Output = ${g.name} on tracks to route them into it`)
+  })
+
+  /** Export all MIDI tracks as a format-1 SMF (480 ppq at the project tempo). */
+  async function doExportMidi(explicitPath?: string): Promise<{ tracks: number; notes: number; path?: string }> {
+    const none = { tracks: 0, notes: 0 }
+    try {
+      const PPQ = 480
+      const tracks = midiTracks
+        .filter((t) => t.clips.some((c) => c.notes.length > 0))
+        .map((t) => ({
+          name: t.name,
+          channel: t.channel,
+          notes: t.clips.flatMap((c) =>
+            c.notes.map((n) => ({ tick: (c.start + n.start) * PPQ, dur: n.dur * PPQ, key: n.key, vel: n.vel }))
+          )
+        }))
+      if (tracks.length === 0) {
+        flashStatus('no MIDI notes to export', true)
+        if (explicitPath) throw new Error('no MIDI notes to export')
+        return none
+      }
+      const bytes = writeSmf(tracks, { ppq: PPQ, bpm: state.bpm, timeSig: { num: state.timeSigNum, den: state.timeSigDen } })
+      const res = await window.daw.midiSave(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, 'project', explicitPath)
+      if (!res) return none
+      if (!res.ok) throw new Error(res.error)
+      const notes = tracks.reduce((a, t) => a + t.notes.length, 0)
+      flashStatus(`MIDI exported: ${tracks.length} tracks, ${notes} notes`)
+      return { tracks: tracks.length, notes, path: res.path }
+    } catch (err) {
+      console.error('[midi] export failed', err)
+      flashStatus(`MIDI export failed: ${(err as Error).message}`, true)
+      if (explicitPath) throw err
+      return none
+    }
+  }
+  $('midi-import').addEventListener('click', () => void doImportMidi())
+  $('midi-export').addEventListener('click', () => void doExportMidi())
+
+  // Options: read the options file (fixed name, user-data folder), apply it, wire the toolbar button
+  void initOptions((m, isErr) => flashStatus(m, isErr))
+  ensureMcpLamp() // the MCP lamp is always there; dark unless the MCP server is on and working
+
+  const monitorBtn = $('monitor-toggle')
+  monitorBtn.addEventListener('click', () => {
+    const on = !scheduler.monitorOn
+    monitorBtn.classList.toggle('on', on)
+    void (on ? scheduler.startMonitor() : scheduler.stopMonitor()).catch((err) => {
+      monitorBtn.classList.remove('on')
+      flashStatus(`monitor: ${(err as Error).message}`, true)
+    })
+  })
+  // instrument lanes follow their MIDI data and the project tempo
+  onMidiChange(() => lanes.forEach(scheduleInstrumentRender))
+  let lastInstBpm = state.bpm
+  subscribe((st) => {
+    if (st.bpm !== lastInstBpm) {
+      lastInstBpm = st.bpm
+      lanes.forEach(scheduleInstrumentRender)
+    }
+  })
+
+  // ---- File menu -----------------------------------------------------------
+  /** Start from an empty project (project rate and tempo are kept). */
+  async function doNew(): Promise<void> {
+    if (lanes.length && !window.confirm('Start a new project? Unsaved changes to the current project are lost.')) return
+    try {
+      await restoreProject({
+        version: 1,
+        sampleRate: state.sampleRate,
+        bpm: 120,
+        timeSig: { num: 4, den: 4 },
+        gridMode: 'off',
+        sources: [],
+        master: { gainDb: 0, inserts: [] },
+        midiTracks: [],
+        view: { framesPerPixel: 0, scrollFrames: 0, playhead: 0 },
+        tracks: []
+      })
+      flashStatus('new project')
+    } catch (err) {
+      console.error('[project] new failed', err)
+      flashStatus(`new project failed: ${(err as Error).message}`, true)
+    }
+  }
+  $('proj-new').addEventListener('click', () => void doNew())
+  {
+    const fileBtn = $('filemenu-btn')
+    const fileList = $('filemenu-list')
+    const setFileMenu = (open: boolean): void => {
+      fileList.hidden = !open
+      fileBtn.setAttribute('aria-expanded', String(open))
+    }
+    fileBtn.addEventListener('click', () => setFileMenu(fileList.hidden))
+    // choosing an item closes the menu (the item's own handler still runs)
+    fileList.addEventListener('click', (e) => {
+      if ((e.target as HTMLElement).closest('button')) setFileMenu(false)
+    })
+    window.addEventListener('pointerdown', (e) => {
+      if (!fileList.hidden && !(e.target as HTMLElement).closest('#filemenu')) setFileMenu(false)
+    })
+    window.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.key === 'Escape' && !fileList.hidden) {
+          setFileMenu(false)
+          fileBtn.focus()
+          e.stopPropagation()
+        }
+      },
+      true
+    )
+  }
+
+  // The native File menu (main) triggers the same handlers as the in-window File menu.
+  const FILE_OPS: Record<string, string> = {
+    new: 'proj-new',
+    open: 'proj-open',
+    save: 'proj-save',
+    saveas: 'proj-saveas',
+    'import-dawproject': 'proj-import-dp',
+    'import-midi': 'midi-import',
+    'export-dawproject': 'proj-export-dp',
+    'export-midi': 'midi-export',
+    'export-stems': 'proj-export-stems',
+    'export-mixdown': 'proj-export-mixdown'
+  }
+  window.daw.onFileCommand?.((op) => {
+    const id = FILE_OPS[op]
+    if (id) $(id).click()
+  })
+
+  // ---- add-track panel (ui/add-track.ts)--------------------------------------
+  initAddTrack({
+    existingNames: () => lanes.map((l) => (l.el.querySelector('.lane-title') as HTMLElement | null)?.textContent ?? ''),
+    pickWavs: async () => {
+      const paths = await window.daw.openAudioFiles()
+      if (!paths || paths.length === 0) return false
+      await loadFiles(paths)
+      return true
+    },
+    addTone: async () => {
+      if (state.playing) await scheduler.stop()
+      const src = makeToneSource(6, 'Demo tone') // generated straight at project rate
+      const lane = addLane(src.name)
+      addClipToLane(lane, src)
+      setLaneSub(lane, `${src.gpu.channelCount}ch · ${(state.sampleRate / 1000) | 0}k`)
+      refreshTotals()
+      fitToProject()
+      void scheduler.warmup()
+    },
+    addInstrument: (spec) => {
+      const lane =
+        spec.kind === 'drums'
+          ? addDrumTrack(spec.name, spec.preset, spec.bars)
+          : spec.kind === 'fm' || spec.kind === 'earlysynth'
+            ? addFmTrack(spec.kind, spec.name, spec.preset, spec.bars)
+            : addSynthTrack(spec.name, spec.bars)
+      refreshTotals()
+      fitToProject()
+      selectLane(lane.id)
+      const mt = lane.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+      if (mt && spec.openEditor) openTrackEditor(mt)
+    },
+    addLine: (spec) => {
+      const lane = addLiveLane(spec.name, spec.ch, spec.stereo)
+      if (lane.live) lane.live.monitor = spec.monitor
+      setLaneSub(lane, liveSub(lane))
+      refreshTotals()
+      selectLane(lane.id)
+      renderDetail()
+    }
+  })
+
+  window.addEventListener('keydown', (e) => {
+    // Ctrl/⌘ project shortcuts work regardless of focus.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+      const k = e.key.toLowerCase()
+      if (k === 's') {
+        e.preventDefault()
+        void (e.shiftKey ? doSaveAs() : doSave())
+        return
+      }
+      if (k === 'n' && !e.shiftKey) {
+        e.preventDefault()
+        void doNew()
+        return
+      }
+      if (k === 'o' && !e.shiftKey) {
+        e.preventDefault()
+        void doOpen()
+        return
+      }
     }
     // Don't hijack keys while typing in a field / on a slider.
     const t = e.target as HTMLElement | null
     const tag = t?.tagName
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t?.isContentEditable) return
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t?.isContentEditable) {
+      // A checkbox / radio / slider has no use for Space of its own while you work a strip (it would toggle
+      // the box instead of play / stop), so Space still reaches the transport — except inside a dialog.
+      const type = (t as HTMLInputElement).type
+      const plain = tag === 'INPUT' && ['checkbox', 'radio', 'range', 'button'].includes(type)
+      if (!(plain && e.code === 'Space' && !t?.closest('#addtrack, #options, #pianoroll, #stepgrid'))) return
+    }
     if (e.repeat) return
     if (e.code === 'Space') {
       e.preventDefault() // else a focused button gets clicked / page scrolls
@@ -2978,6 +5036,13 @@ async function boot(): Promise<void> {
     else if (e.key === '3') setTool('range')
   })
 
+  // Space is activation on keyup for a focused checkbox / radio: swallow it where keydown went to the transport.
+  window.addEventListener('keyup', (e) => {
+    const t = e.target as HTMLElement | null
+    if (e.code !== 'Space' || t?.tagName !== 'INPUT' || t.closest('#addtrack, #options, #pianoroll, #stepgrid')) return
+    if (['checkbox', 'radio'].includes((t as HTMLInputElement).type)) e.preventDefault()
+  })
+
   // ---- edit tools: palette + pointer routing on the tracks area ----
   for (const b of document.querySelectorAll<HTMLButtonElement>('#toolbar .tool'))
     b.addEventListener('click', () => setTool(b.dataset.tool as EditTool))
@@ -2987,18 +5052,6 @@ async function boot(): Promise<void> {
   tracksEl.addEventListener('pointerdown', onEditPointerDown)
   // Edit menu / accelerators (Cut·Copy·Paste·Delete·Split·Select All) from main.
   window.daw.onEditCommand?.(runEditOp)
-
-  $('wiz-tone').addEventListener('click', async () => {
-    closeWizard()
-    if (state.playing) await scheduler.stop()
-    const src = makeToneSource(6, 'Demo tone') // generated straight at project rate
-    const lane = addLane(src.name)
-    addClipToLane(lane, src)
-    setLaneSub(lane, `${src.gpu.channelCount}ch · ${(state.sampleRate / 1000) | 0}k`)
-    refreshTotals()
-    fitToProject()
-    void scheduler.warmup()
-  })
 
   // One track per WAV path, loaded sequentially so a big stem set doesn't spike
   // memory. Progress shows in the gpu-status slot (frame() owns #metrics).
@@ -3017,13 +5070,6 @@ async function boot(): Promise<void> {
     fitToProject()
     void scheduler.warmup()
   }
-
-  $('wiz-wav').addEventListener('click', async () => {
-    const paths = await window.daw.openAudioFiles()
-    if (!paths || paths.length === 0) return
-    closeWizard()
-    await loadFiles(paths)
-  })
 
   // ---- recording ---------------------------------------------------------
   /** Test hook (MCP / regression): record a built-in signal instead of hardware input. */
@@ -3058,8 +5104,9 @@ async function boot(): Promise<void> {
           gpu: t.gpu,
           envelope: computeEnvelope(t.planar, state.sampleRate)
         })
-        clearRange(lane, t.startFrame, t.startFrame + t.frames) // new take replaces what it overlaps
-        addClipToLane(lane, src, t.startFrame)
+        // t.startFrame is already latency-compensated; t.skip = head frames before the timeline origin
+        clearRange(lane, t.startFrame, t.startFrame + t.frames - (t.skip ?? 0)) // new take replaces what it overlaps
+        addClipToLane(lane, src, t.startFrame, t.skip ?? 0)
         setLaneSub(lane, `${n}ch · ${(state.sampleRate / 1000) | 0}k · rec`)
         lane.dirty = true
         wrote++
@@ -3075,12 +5122,19 @@ async function boot(): Promise<void> {
   async function startRecording(synthetic: boolean): Promise<void> {
     if (state.playing) throw new Error('stop transport first')
     const armed = lanes.filter((l) => l.mix.rec)
-    if (!armed.length) {
-      flashStatus('arm a track first (R button)', true)
+    // instrument lanes record MIDI (from their input port), not audio
+    const armedAudio = armed.filter((l) => !l.inst)
+    const armedMidi = armed
+      .map((l) => (l.inst ? midiTrackById(l.inst.midiTrackId) : undefined))
+      .filter((t): t is MidiTrack => !!t && !!t.inId)
+    if (!armedAudio.length && !armedMidi.length) {
+      flashStatus('arm a track first (R button; an instrument track also needs a MIDI input)', true)
       throw new Error('no track is armed (set rec on a track first)')
     }
-    const targets = armed.map((l) => ({ laneId: l.id, ch: l.recIn.ch, stereo: l.recIn.stereo }))
-    await scheduler.startRecord(state.playhead, targets, { synthetic })
+    const targets = armedAudio.map((l) => ({ laneId: l.id, ch: l.recIn.ch, stereo: l.recIn.stereo }))
+    // MIDI-only take: a synthetic take with no targets just keeps the transport running
+    await scheduler.startRecord(state.playhead, targets, { synthetic: targets.length === 0 ? true : synthetic })
+    if (scheduler.recording && armedMidi.length) midiIo.startRecording(armedMidi, () => scheduler.currentFrame())
   }
   /** Arm-driven record toggle: starts at the playhead, Stop (or this again) commits the takes. */
   function toggleRecord(): void {
@@ -3093,12 +5147,183 @@ async function boot(): Promise<void> {
   }
   recBtn.addEventListener('click', toggleRecord)
 
+  // MIDI ports for instrument tracks (external output + keyboard recording)
+  void midiIo.init()
+  midiIo.onPortsChange(() => {
+    const sel = typeof selectedId === 'number' ? laneById(selectedId) : undefined
+    if (sel?.inst) renderDetail()
+  })
+  midiIo.startPump(
+    () => scheduler.currentFrame(),
+    (mt) => {
+      const l = lanes.find((x) => x.inst?.midiTrackId === mt.id)
+      return !l || (!l.mix.mute && (!anySolo || l.mix.solo))
+    }
+  )
+
   // ---- MCP tool handlers (dev/regression; the server itself is opt-in in main) ----
   registerMcpTools({
     lanes: lanes as unknown as McpLane[],
     scheduler,
     serializeProject,
     restoreProject: (p) => restoreProject(p as ProjectFile),
+    importDawproject: (path) => doImportDawproject(path),
+    importMidi: (path) => doImportMidi(path),
+    addLiveLane: (name, ch, stereo) => {
+      const lane = addLiveLane(name, ch, stereo)
+      refreshTotals()
+      return lane as unknown as McpLane
+    },
+    monitor: async (action, synthetic, latencyMs) => {
+      if (latencyMs !== undefined && liveBusRef) liveBusRef.latencyMs = latencyMs
+      if (action === 'start') scheduler.liveSynthetic = synthetic // stop must not change the input source
+      if (action === 'start') await scheduler.startMonitor()
+      else await scheduler.stopMonitor()
+      monitorBtn.classList.toggle('on', scheduler.monitorOn)
+      return scheduler.liveInfo()
+    },
+    liveInfo: () => ({ ...scheduler.liveInfo(), inputChannels: scheduler.inputChannels, inputError: scheduler.inputError }),
+    exportDawproject: (path) => doExportDawproject(path),
+    addDrumTrack: (name, preset, bars, bpm) => {
+      if (bpm && bpm > 0) update({ bpm })
+      const lane = addDrumTrack(name, preset, bars)
+      refreshTotals()
+      return lane as unknown as McpLane
+    },
+    pianoRoll: (cmd) => {
+      const mt = cmd.track !== undefined ? midiTracks[cmd.track] : undefined
+      if (cmd.action === 'open') {
+        if (!mt) throw new Error(`no MIDI track at index ${cmd.track}`)
+        openPianoRoll(mt, cmd.clip ?? 0)
+      } else if (!pianoRoll) {
+        throw new Error('piano roll was never opened')
+      } else if (cmd.action === 'pointer') {
+        pianoRoll.pointer(cmd.kind ?? 'down', cmd.x ?? 0, cmd.y ?? 0, { shift: cmd.shift, alt: cmd.alt, button: cmd.button })
+      } else if (cmd.action === 'key') {
+        pianoRoll.key(cmd.key ?? '', { ctrl: cmd.ctrl })
+      } else if (cmd.action === 'close') {
+        pianoRoll.close()
+      }
+      return pianoRoll ? pianoRoll.info() : null
+    },
+    exportMidi: (path) => doExportMidi(path),
+    groupsList: () => listGroups(),
+    groupAdd: (name, tracks) => {
+      const g = addGroup(cleanStemName(name) || `Group ${groups.length + 1}`)
+      for (const t of tracks) {
+        const l = laneById(t)
+        if (l) {
+          l.group = g.id
+          adoptGroupColor(l, g)
+        }
+      }
+      refreshSolo()
+      renderDetail()
+      return groupSummary(g)
+    },
+    groupSet: (id, patch) => {
+      const g = groupById(id)
+      if (!g) throw new Error(`no group ${id} (groups: ${groups.map((x) => x.id).join(', ') || 'none'})`)
+      if (patch.name !== undefined) {
+        g.name = cleanStemName(patch.name) || g.name
+        ;(g.strip.el.querySelector('.strip-head .t') as HTMLElement).textContent = g.name
+      }
+      if (patch.color !== undefined) {
+        const c = normalizeColor(patch.color)
+        if (!c) throw new Error('color must be #rrggbb, #rgb or a palette number 0-11')
+        g.color = c
+        applyGroupColor(g)
+        for (const l of lanes) if (l.group === g.id) adoptGroupColor(l, g)
+      }
+      if (patch.gainDb !== undefined) g.mix.gainDb = patch.gainDb
+      if (patch.pan !== undefined) g.mix.pan = patch.pan
+      if (patch.mute !== undefined) g.mix.mute = patch.mute
+      if (patch.solo !== undefined) g.mix.solo = patch.solo
+      if (patch.tracks) {
+        const want = new Set(patch.tracks)
+        for (const l of lanes) {
+          if (want.has(l.id)) l.group = g.id
+          else if (l.group === g.id) l.group = undefined
+        }
+      }
+      g.strip.setGain(g.mix.gainDb)
+      g.strip.setPan(g.mix.pan)
+      g.strip.m.classList.toggle('on', g.mix.mute)
+      g.strip.s.classList.toggle('on', g.mix.solo)
+      refreshSolo()
+      renderDetail()
+      return groupSummary(g)
+    },
+    groupRemove: (id) => {
+      if (!groupById(id)) throw new Error(`no group ${id}`)
+      removeGroup(id)
+      return { removed: id }
+    },
+    routeTrack: (track, group) => {
+      const l = laneById(track)
+      if (!l) throw new Error(`no track ${track}`)
+      if (group !== null && !groupById(group)) throw new Error(`no group ${group} (groups: ${groups.map((x) => x.id).join(', ') || 'none'})`)
+      l.group = group ?? undefined
+      adoptGroupColor(l, group !== null ? groupById(group) : undefined)
+      renderDetail()
+    },
+    groupInserts: (id) => groupById(id)?.inserts ?? null,
+    setTrackColor: (track, color) => {
+      const l = laneById(track)
+      if (!l) throw new Error(`no track ${track}`)
+      const c = normalizeColor(color)
+      if (!c) throw new Error('color must be #rrggbb, #rgb or a palette number 0-11')
+      setLaneColor(l, c)
+      if (selectedId === l.id) renderDetail()
+      return { id: l.id, color: l.color, stem: l.stem ?? '', stemTracksFollow: !!l.stem }
+    },
+    groupStripEl: (id) => groupById(id)?.strip.el ?? null,
+    stemsList: () => listStems(),
+    stemSet: (track, stem) => setStem(track, stem),
+    stemsExport: (req) => exportStems(req),
+    analyzeSpectrum: (req) => analyzeSpectrum(req),
+    trackLevels: (req) => trackLevels(req),
+    mixdownExport: (req) => exportMixdown(req),
+    groupOutputPeaks: () => groupOutputPeaks(),
+    addInstrumentTrack: (name, notes, bpm, kind) => {
+      if (bpm && bpm > 0) update({ bpm })
+      const mt = addMidiTrack(name)
+      if (kind === 'drums') mt.instrument = { kind: 'drums', params: defaultDrumParams() }
+      else if (kind === 'earlysynth') mt.instrument = { kind: 'earlysynth', params: earlyPreset('Pop Pluck') ?? {} }
+      else if (kind === 'fm') mt.instrument = { kind: 'fm', params: fmPreset('Pop Pluck') ?? {} }
+      const end = notes.reduce((m, n) => Math.max(m, n.start + n.dur), 4)
+      const clip = addMidiClip(mt, 0, Math.ceil(end), name)
+      for (const n of notes) addNote(clip, n.start, n.dur, n.key, n.vel ?? 100)
+      const lane = addInstrumentLane(mt)
+      refreshTotals()
+      return lane as unknown as McpLane
+    },
+    swapInstrument: (laneId, kind) => {
+      const lane = laneById(laneId)
+      if (!lane?.inst) throw new Error(`track ${laneId} is not an instrument track`)
+      const k = normalizeInstrumentKind(kind)
+      if (!listInstruments().some((i) => i.kind === k)) throw new Error(`unknown instrument "${kind}" (${listInstruments().map((i) => i.kind).join(' | ')})`)
+      swapInstrument(lane, k)
+      const mt = midiTrackById(lane.inst.midiTrackId)
+      return mt?.instrument?.kind ?? k
+    },
+    setInstrumentParams: (laneId, patch) => {
+      const lane = laneById(laneId)
+      const mt = lane?.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+      if (!lane || !mt || !mt.instrument) throw new Error(`track ${laneId} is not an instrument track`)
+      // { preset: 'Bell' } loads a factory preset first; the other keys then override it
+      const presetName = typeof patch['preset'] === 'string' ? String(patch['preset']) : ''
+      const ikind = normalizeInstrumentKind(mt.instrument.kind)
+      if ((ikind === 'earlysynth' || ikind === 'fm') && presetName) {
+        const fresh = (ikind === 'fm' ? fmPreset : earlyPreset)(presetName)
+        if (!fresh) throw new Error(`unknown FM preset "${presetName}" (see instrument_presets)`)
+        mt.instrument.params = fresh
+      }
+      Object.assign(mt.instrument.params, patch)
+      renderInstrumentLane(lane)
+      if (selectedId === lane.id) renderDetail()
+      return mt.instrument.params
+    },
     addWavLane: async (path, title) => ((await addWavLane(path, title)) as unknown as McpLane | null),
     addToneLane: (seconds, title) => {
       const src = makeToneSource(seconds, title || 'Demo tone')
@@ -3150,7 +5375,7 @@ async function boot(): Promise<void> {
     },
     startRecording,
     takesSettled: () => commitPromise,
-    gpuStatus: () => gpuStatus.textContent ?? ''
+    gpuStatus: () => gpuLamp.title
   })
 
   // ---- transport ---------------------------------------------------------
@@ -3159,10 +5384,92 @@ async function boot(): Promise<void> {
     else if (state.trackCount) void scheduler.start(state.playhead >= state.totalFrames ? 0 : state.playhead)
   }
   playBtn.addEventListener('click', togglePlay)
+
+  // Transport bar: go to start / rewind / forward move by whole bars (Shift = four bars)
+  const barFrames = (): number => (60 / state.bpm) * (4 / state.timeSigDen) * state.timeSigNum * state.sampleRate
+  const goTo = (frame: number): void => {
+    const f = Math.max(0, Math.min(state.totalFrames, frame))
+    if (state.playing) void scheduler.seek(f)
+    else update({ playhead: f })
+  }
+  $('tp-start').addEventListener('click', () => goTo(0))
+  $('tp-rew').addEventListener('click', (e) => {
+    const bar = barFrames()
+    goTo((Math.ceil(state.playhead / bar - 1e-6) - (e.shiftKey ? 4 : 1)) * bar) // previous bar line
+  })
+  $('tp-ff').addEventListener('click', (e) => {
+    const bar = barFrames()
+    goTo((Math.floor(state.playhead / bar + 1e-6) + (e.shiftKey ? 4 : 1)) * bar) // next bar line
+  })
   $('stop').addEventListener('click', () => {
     void scheduler.stop()
     update({ playhead: 0 })
   })
+
+  // ---- external control surface (P1-Nano class, MCU mode) ------------------
+  const activeLane = (): Lane | null =>
+    lanes.find((l) => l.id === selectedId) ?? null
+  const mcu = new McuSurface({
+    track: () => {
+      const l = activeLane()
+      if (!l) return null
+      return {
+        index: lanes.indexOf(l),
+        count: lanes.length,
+        name: (l.el.querySelector('.lane-title') as HTMLElement).textContent ?? '',
+        gainDb: l.mix.gainDb,
+        pan: l.mix.pan,
+        mute: l.mix.mute,
+        solo: l.mix.solo,
+        rec: l.mix.rec
+      }
+    },
+    setGainDb: (db) => {
+      const l = activeLane()
+      if (!l) return
+      l.strip.fader.value = String(Math.round(db * 10) / 10)
+      l.strip.fader.dispatchEvent(new Event('input')) // same path as dragging the on-screen fader
+    },
+    setPan: (p) => {
+      const l = activeLane()
+      if (!l) return
+      l.mix.pan = Math.max(-1, Math.min(1, p))
+      l.strip.setPan(l.mix.pan)
+      if (l.id === selectedId) detailApi?.setPan(l.mix.pan)
+    },
+    jog: (ticks) => {
+      // one detent = a quarter beat at the project tempo (a 16th note)
+      const step = (60 / state.bpm / 4) * state.sampleRate
+      const to = Math.max(0, Math.min(state.totalFrames, state.playhead + ticks * step))
+      if (state.playing) void scheduler.seek(to)
+      else update({ playhead: to })
+    },
+    masterDb: () => Number(masterEl.value),
+    setMasterDb: (db) => {
+      masterEl.value = String(Math.round(db * 10) / 10)
+      masterEl.dispatchEvent(new Event('input')) // same path as the on-screen master fader
+    },
+    bank: (delta) => {
+      if (!lanes.length) return
+      const i = Math.max(0, Math.min(lanes.length - 1, Math.max(0, lanes.findIndex((l) => l.id === selectedId)) + delta))
+      selectLane(lanes[i].id)
+    },
+    toggle: (what) => {
+      const l = activeLane()
+      if (l) (what === 'mute' ? l.strip.m : what === 'solo' ? l.strip.s : l.strip.r).click()
+    },
+    transport: (cmd) => {
+      if (cmd === 'play') togglePlay()
+      else if (cmd === 'stop') $('stop').click()
+      else if (cmd === 'record') recBtn.click()
+      else if (!state.playing)
+        update({ playhead: cmd === 'rew' ? 0 : state.totalFrames })
+    },
+    timeSec: () => state.playhead / state.sampleRate,
+    playing: () => state.playing
+  })
+  void mcu.start()
+  mcuTick = () => mcu.tick()
 
   srSelect.addEventListener('change', () => {
     // Project rate is fixed once tracks exist (the select is disabled then);
@@ -3263,12 +5570,13 @@ async function boot(): Promise<void> {
 
   let pv = { fpp: -1, scroll: -1, total: -1, tc: -1 }
   subscribe((s) => {
-    playBtn.textContent = s.playing ? '❚❚ Pause' : '▶ Play'
+    playBtn.title = s.playing ? 'Pause (Space)' : 'Play (Space)'
+    playBtn.setAttribute('aria-label', s.playing ? 'Pause' : 'Play')
     playBtn.classList.toggle('playing', s.playing)
     playBtn.disabled = s.trackCount === 0
     recBtn.disabled = s.trackCount === 0
     recBtn.classList.toggle('recording', scheduler.recording)
-    recBtn.textContent = scheduler.recording ? '● Recording…' : '● Rec'
+    recBtn.setAttribute('aria-label', scheduler.recording ? 'Recording' : 'Record')
     srSelect.disabled = s.playing || s.trackCount > 0 // project rate locks once a track exists
     hint.hidden = s.trackCount > 0
     // Any timeline-transform or track-count change needs a waveform redraw.
@@ -3365,6 +5673,10 @@ async function boot(): Promise<void> {
 
   function frame(): void {
     if (state.playing && !scrubbing) update({ playhead: scheduler.currentFrame() })
+    if (midiIo.recording && !scheduler.recording) {
+      const n = midiIo.finishRecording(state.playhead)
+      if (n > 0) flashStatus(`recorded ${n} MIDI note${n > 1 ? 's' : ''}`)
+    }
 
     // The waveform canvases only depend on peak data + the timeline transform, so
     // redraw a lane only when it (or the shared view) is dirty AND it's actually
@@ -3380,7 +5692,7 @@ async function boot(): Promise<void> {
           const onScreen = y + lane.el.offsetHeight >= top && y <= bottom
           if (!onScreen) continue
           if (viewDirty || lane.dirty) {
-            lane.renderer.draw(resolvePeakClips(lane), state)
+            lane.renderer.draw(lane.inst ? [] : resolvePeakClips(lane), state)
             drawLaneFx(lane)
             lane.dirty = false
           }
@@ -3388,6 +5700,7 @@ async function boot(): Promise<void> {
       } catch (err) {
         gpuStatus.textContent = `render stopped: ${(err as Error).message}`
         gpuStatus.className = 'err'
+        setGpuLamp('err', `render stopped: ${(err as Error).message}`)
         return // stop the loop; a device loss needs a full reload
       }
       viewDirty = false
@@ -3398,6 +5711,8 @@ async function boot(): Promise<void> {
     playhead.style.opacity =
       state.totalFrames > 0 && waveX >= -0.5 && waveX <= waveViewportPx() + 0.5 ? '1' : '0'
     clock.textContent = fmtTime(state.playhead)
+    clockBars.textContent = fmtBars(state.playhead)
+    mcuTick()
 
     // Top ruler + grid overlay. Both are cheap DOM/2D work; skip when nothing
     // that affects them changed (the grid also ignores playhead moves).
@@ -3413,16 +5728,18 @@ async function boot(): Promise<void> {
       syncGrid()
     }
 
-    // ---- channel-strip meters (post-fader, from the source envelope) ----
+    // ---- channel-strip meters (real post-fader output of each channel, measured on the GPU) ----
     const sL = stripsScrollEl.scrollLeft
     const sR = sL + stripsScrollEl.clientWidth
     const now = performance.now()
     const writeText = now - meterTextAt >= 1000 // dB / peak numbers refresh ~1 Hz
     if (writeText) meterTextAt = now
-    for (const lane of lanes) {
-      const raw = state.playing ? laneMeterLevel(lane, state.playhead) : 0
-      const audible = !lane.mix.mute && (!anySolo || lane.mix.solo)
-      const post = audible ? raw * dbToLin(lane.mix.gainDb) : 0
+    const mtr = scheduler.metrics() // read once per frame: channel meters, then the master strip below
+    for (let li = 0; li < lanes.length; li++) {
+      const lane = lanes[li]
+      // the real channel output: after the strip, the inserts, the fader and the pan (measured on the GPU,
+      // for the block being played; mute / solo are already in it)
+      const post = state.playing ? mtr.trackPeaks[li] || 0 : 0
       lane.vu += (post - lane.vu) * (post > lane.vu ? 0.55 : 0.09) // fast attack, slow release
       if (post > lane.peakHold) lane.peakHold = post
 
@@ -3439,16 +5756,36 @@ async function boot(): Promise<void> {
       const norm = Math.max(0, Math.min(1, (linToDb(lane.vu) + 54) / 54))
       lane.strip.vu.style.height = `${(1 - norm) * 100}%`
 
+      // left number = the fader's value (always, playing or not; follows the fader at once, also when it is
+      // moved by MCP / the AI). The level is the bar next to it; the right number is the peak.
+      const faderText = fmtFaderDb(lane.mix.gainDb)
+      if (lane.strip.db.textContent !== faderText) lane.strip.db.textContent = faderText
+
       if (writeText) {
-        const db = linToDb(post)
-        lane.strip.db.textContent = db === -Infinity ? '−∞' : db.toFixed(1)
         const pk = linToDb(lane.peakHold)
         lane.strip.peak.textContent = pk === -Infinity ? '−∞' : pk.toFixed(1)
         lane.strip.peak.classList.toggle('over', pk > 0)
       }
     }
 
-    const m = scheduler.metrics()
+    // group channels: their own post-fader output, measured on the GPU like the tracks'
+    for (let gi = 0; gi < groups.length; gi++) {
+      const g = groups[gi]
+      const post = state.playing ? mtr.groupPeaks[gi] || 0 : 0
+      g.vu += (post - g.vu) * (post > g.vu ? 0.55 : 0.09)
+      if (post > g.peakHold) g.peakHold = post
+      const norm = Math.max(0, Math.min(1, (linToDb(g.vu) + 54) / 54))
+      g.strip.vu.style.height = `${(1 - norm) * 100}%`
+      const ft = fmtFaderDb(g.mix.gainDb)
+      if (g.strip.db.textContent !== ft) g.strip.db.textContent = ft
+      if (writeText) {
+        const pk = linToDb(g.peakHold)
+        g.strip.peak.textContent = pk === -Infinity ? '−∞' : pk.toFixed(1)
+        g.strip.peak.classList.toggle('over', pk > 0)
+      }
+    }
+
+    const m = mtr
 
     // ---- master strip meter (peak of the readback block, post master-gain) ----
     masterVu += (m.masterPeak - masterVu) * (m.masterPeak > masterVu ? 0.55 : 0.09)

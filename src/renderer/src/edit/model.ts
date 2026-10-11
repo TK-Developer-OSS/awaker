@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -23,9 +23,9 @@ export const FADE_SHAPE_CODE: Record<FadeShape, number> = { lin: 0, eqpow: 1, lo
 export interface AudioSource {
   id: number
   name: string
-  /** Source WAV path (null for a generated tone). */
+  /** Source WAV path (null for a generated tone / instrument render). */
   path: string | null
-  kind: 'wav' | 'tone'
+  kind: 'wav' | 'tone' | 'inst'
   /** Tone length in seconds (only when kind === 'tone'). */
   toneSeconds?: number
   /** VRAM sample buffers + full-length peak pyramid. */

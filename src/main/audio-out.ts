@@ -1,18 +1,18 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
-import {
-  RtAudio,
-  RtAudioApi,
-  RtAudioFormat,
-  RtAudioStreamFlags,
-  type RtAudioDeviceInfo
-} from 'audify'
+import type { RtAudioDeviceInfo } from 'audify'
+import { loadAudioModule } from './audio-module'
+import { LiveRing } from './live-ring'
+
+// The audio module is picked at start-up: the app's own (RtAudio + cwASIO) when built, else the audify package.
+const { RtAudio, RtAudioApi, RtAudioFormat, RtAudioStreamFlags } = loadAudioModule()
+type RtAudio = InstanceType<typeof RtAudio>
 
 /**
  * Native stereo output. Backend order, best first:
- *   1. **ASIO** on an Antelope / Zen Go driver (exclusive, native rate, ~24-bit).
+ *   1. **ASIO** on a pro-audio-interface driver (exclusive, native rate, ~24-bit).
  *   2. **WASAPI exclusive** at the project rate (bypasses the shared-mode SRC).
  *   3. **WASAPI shared** as a last resort (the driver may resample → glitches).
  *
@@ -26,6 +26,8 @@ import {
  */
 
 const CHANNELS = 2
+/** Spacing of the synthetic impulse input used to check live-path time alignment. */
+const IMPULSE_PERIOD = 4800
 const ZEN_RE = /zen ?go|antelope|synergy core/i
 
 /**
@@ -50,8 +52,12 @@ export interface AudioOutConfig {
   deviceId?: number
   /** Record: number of input channels to open alongside the output (0 = none). */
   inputChannels?: number
-  /** Record from a built-in test signal instead of hardware (regression / no interface). */
-  inputSynthetic?: boolean
+  /**
+   * Record from a built-in test signal instead of hardware (regression / no interface).
+   * `true` = stereo tones (220 / 330 Hz); `'impulse'` = a click every 4800 frames on both channels,
+   * used to verify time alignment of the live path.
+   */
+  inputSynthetic?: boolean | 'impulse'
 }
 
 export interface AudioOutStatus {
@@ -73,6 +79,21 @@ export interface AudioOutStatus {
   inputError: string
   /** Input frames delivered to the renderer since begin(). */
   inputFrames: number
+  /** Live (line-input) path: counters and timing. All zero while no live lane is active. */
+  live: {
+    enabled: boolean
+    blocks: number
+    late: number
+    tooFar: number
+    /** Input block arrival in main -> processed block back in main (ms): mean / max. */
+    rttMeanMs: number
+    rttMaxMs: number
+    /** Frames between a block's input position and the output frame it was placed at. */
+    deltaFrames: number
+    /** Synthetic-impulse self-test: impulses seen at the output and the worst position error (frames). */
+    alignImpulses: number
+    alignMaxErrFrames: number
+  }
 }
 
 interface OpenPlan {
@@ -109,7 +130,26 @@ export class NativeAudioOut {
   private inputError = ''
   private inputFrames = 0
   private inputSynthetic = false
+  private synthKind: 'tone' | 'impulse' = 'tone'
   private inputLive = false // false until begin(); input before that is discarded
+
+  // --- live (line-input) path ---
+  /** Set by index.ts: receives batched input for the renderer's live bus (low latency, ~256 frames). */
+  onLiveInput: ((interleaved: Float32Array, startFrame: number, channels: number) => void) | null = null
+  private liveEnabled = false
+  private liveRing = new LiveRing(1)
+  /** Frames the output callback has played since begin() — the clock live blocks are placed on. */
+  private outFrames = 0
+  private livePendingIn: Float32Array[] = []
+  private livePendingFrames = 0
+  private livePendingStart = 0
+  private liveStamps = new Map<number, number>() // input batch start frame -> performance.now()
+  private liveBlocks = 0
+  private liveRttSum = 0
+  private liveRttMax = 0
+  private liveDelta = 0
+  private alignImpulses = 0
+  private alignMaxErr = 0
 
   // Reused every device callback so a 192 kHz callback rate doesn't churn GC.
   private outScratch = new Float32Array(0)
@@ -207,6 +247,7 @@ export class NativeAudioOut {
     this.inputFrames = 0
     this.inputLive = false
     this.inputSynthetic = !!cfg.inputSynthetic
+    this.synthKind = cfg.inputSynthetic === 'impulse' ? 'impulse' : 'tone'
     const wantIn = cfg.inputSynthetic ? 0 : Math.max(0, cfg.inputChannels ?? 0)
 
     const errors: string[] = []
@@ -214,6 +255,12 @@ export class NativeAudioOut {
       let rt: RtAudio | null = null
       try {
         rt = new RtAudio(plan.api)
+        // RtAudio falls back to another compiled API when the asked one is not in the build (the WASAPI-only
+        // module): that is not ASIO, so the ASIO plan is skipped instead of running under the wrong name
+        if (plan.api === RtAudioApi.WINDOWS_ASIO && !/asio/i.test(rt.getApi())) {
+          errors.push('ASIO: not in this build (the ASIO add-on is not installed)')
+          continue
+        }
         const dev = plan.pick(rt)
         if (!dev) {
           errors.push(`${plan.backend}: no matching device`)
@@ -307,6 +354,7 @@ export class NativeAudioOut {
     if (!this.rt || this.rt.isStreamRunning()) return
     this.inputFrames = 0
     this.inputLive = true
+    this.resetLive()
     // A little silence in RtAudio's own queue so its first callbacks never stall.
     for (let i = 0; i < 3; i++) this.rt.write(this.silenceBuf)
     this.rt.start()
@@ -359,8 +407,81 @@ export class NativeAudioOut {
       backend: this.backend,
       inputChannels: this.inputChannels,
       inputError: this.inputError,
-      inputFrames: this.inputFrames
+      inputFrames: this.inputFrames,
+      live: {
+        enabled: this.liveEnabled,
+        blocks: this.liveBlocks,
+        late: this.liveRing.late,
+        tooFar: this.liveRing.tooFar,
+        rttMeanMs: this.liveBlocks ? this.liveRttSum / this.liveBlocks : 0,
+        rttMaxMs: this.liveRttMax,
+        deltaFrames: this.liveDelta,
+        alignImpulses: this.alignImpulses,
+        alignMaxErrFrames: this.alignMaxErr
+      }
     }
+  }
+
+  // ---- live (line-input) path ----------------------------------------------------
+
+  /** The renderer turns this on while it has live lanes; off = no per-callback cost. */
+  setLiveEnabled(on: boolean): void {
+    this.liveEnabled = on
+    if (!on) this.resetLive()
+  }
+
+  private resetLive(): void {
+    // 1 s of landing space: enough for any latency we would ever ask for, small enough to stay cache-warm
+    this.liveRing = new LiveRing(Math.max(1024, this.sampleRate))
+    this.outFrames = 0
+    this.livePendingIn = []
+    this.livePendingFrames = 0
+    this.liveStamps.clear()
+    this.liveBlocks = 0
+    this.liveRttSum = 0
+    this.liveRttMax = 0
+    this.liveDelta = 0
+    this.alignImpulses = 0
+    this.alignMaxErr = 0
+  }
+
+  /**
+   * A processed live block from the renderer. `outStart` is the output frame it belongs at,
+   * `inStart` the input frame its first sample was captured at (for the round-trip stat).
+   */
+  pushLive(interleaved: Float32Array, outStart: number, inStart: number): void {
+    if (!this.running || !this.liveEnabled) return
+    this.liveRing.write(outStart, interleaved, this.outFrames)
+    this.liveBlocks++
+    this.liveDelta = outStart - inStart
+    const t0 = this.liveStamps.get(inStart)
+    if (t0 !== undefined) {
+      const rtt = performance.now() - t0
+      this.liveRttSum += rtt
+      if (rtt > this.liveRttMax) this.liveRttMax = rtt
+      this.liveStamps.delete(inStart)
+    }
+  }
+
+  /** Batch device-sized input blocks to ~256 frames, then hand them to the renderer's live bus. */
+  private liveIn(f: Float32Array, start: number, nCh: number): void {
+    if (!this.liveEnabled || !this.onLiveInput) return
+    if (this.livePendingFrames === 0) this.livePendingStart = start
+    this.livePendingIn.push(f)
+    this.livePendingFrames += f.length / nCh
+    if (this.livePendingFrames < 256) return
+    const out = new Float32Array(this.livePendingFrames * nCh)
+    let o = 0
+    for (const a of this.livePendingIn) {
+      out.set(a, o)
+      o += a.length
+    }
+    const s = this.livePendingStart
+    this.livePendingIn = []
+    this.livePendingFrames = 0
+    this.liveStamps.set(s, performance.now())
+    if (this.liveStamps.size > 256) this.liveStamps.delete(this.liveStamps.keys().next().value as number)
+    this.onLiveInput(out, s, nCh)
   }
 
   /** Hardware input block (interleaved f32, `nCh` channels) → renderer. */
@@ -369,6 +490,7 @@ export class NativeAudioOut {
     const f = new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))
     const start = this.inputFrames
     this.inputFrames += f.length / nCh
+    this.liveIn(f, start, nCh)
     this.onInput(f, start, nCh)
   }
 
@@ -380,10 +502,17 @@ export class NativeAudioOut {
     const w = (2 * Math.PI) / this.sampleRate
     for (let i = 0; i < frames; i++) {
       const t = start + i
-      f[i * 2] = 0.5 * Math.sin(w * 220 * t)
-      f[i * 2 + 1] = 0.5 * Math.sin(w * 330 * t)
+      if (this.synthKind === 'impulse') {
+        const hit = t % IMPULSE_PERIOD === 0 ? 0.5 : 0
+        f[i * 2] = hit
+        f[i * 2 + 1] = hit
+      } else {
+        f[i * 2] = 0.5 * Math.sin(w * 220 * t)
+        f[i * 2 + 1] = 0.5 * Math.sin(w * 330 * t)
+      }
     }
     this.inputFrames += frames
+    this.liveIn(f, start, 2)
     this.onInput(f, start, 2)
   }
 
@@ -405,6 +534,7 @@ export class NativeAudioOut {
         this.outScratch.set(this.ring.subarray(0, (need - firstFrames) * CHANNELS), firstFrames * CHANNELS)
       }
       this.readFrame += need
+      this.addLive(need)
       this.rt.write(this.outBuf)
     } else {
       // Emit silence, keep the clock moving. Only counts as an underrun once
@@ -413,8 +543,39 @@ export class NativeAudioOut {
       // underrun instead of freezing at a stale positive value.
       if (this.gotFirstChunk) this.underrunFrames += need
       this.readFrame = this.writeFrame
-      this.rt.write(this.silenceBuf)
+      if (this.liveEnabled) {
+        // nothing queued from the transport — the live path may still have something to say
+        this.outScratch.fill(0)
+        this.addLive(need)
+        this.rt.write(this.outBuf)
+      } else {
+        this.rt.write(this.silenceBuf)
+      }
     }
     this.playedFrames += need
+    this.outFrames += need
+  }
+
+  /** Add the live blocks that fall in this output block (frames outFrames .. outFrames+need) onto outScratch. */
+  private addLive(need: number): void {
+    if (!this.liveEnabled) return
+    // the synthetic-impulse self-test reads the live contribution on its own
+    const probe = this.synthKind === 'impulse' && this.inputSynthetic ? new Float32Array(need * 2) : null
+    const any = probe
+      ? this.liveRing.take(this.outFrames, need, probe)
+      : this.liveRing.take(this.outFrames, need, this.outScratch)
+    if (probe && any) {
+      for (let i = 0; i < need; i++) {
+        // the test input is silent except the impulses and the path is bit-exact, so any non-zero sample is one
+        if (Math.abs(probe[i * 2]) > 1e-9) {
+          // output frame o carries input frame o - delta; impulses sit on multiples of IMPULSE_PERIOD
+          const inFrame = this.outFrames + i - this.liveDelta
+          const err = ((inFrame + IMPULSE_PERIOD / 2) % IMPULSE_PERIOD) - IMPULSE_PERIOD / 2
+          this.alignImpulses++
+          this.alignMaxErr = Math.max(this.alignMaxErr, Math.abs(err))
+        }
+      }
+      for (let i = 0; i < need * 2; i++) this.outScratch[i] += probe[i]
+    }
   }
 }

@@ -6,3 +6,16 @@ dist/
 .vite/
 .env
 .env.local
+__pycache__/
+awaker-ai.json
+awaker-ai-key-*.bin
+
+# release assets are uploaded by hand
+github/*.zip
+
+# the audio module is built locally (npm run build:audio)
+native/audio/build/
+
+# local-PC / MCP operating notes: kept in the local repo, not published (github/ must not get them)
+/CLAUDE.md
+/.claude/skills/awaker/SKILL.md

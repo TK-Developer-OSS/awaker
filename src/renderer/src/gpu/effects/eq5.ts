@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -15,6 +15,26 @@ export interface Eq5Band {
 
 /** Fixed band shapes: shelf / peak / peak / peak / shelf. */
 const KINDS: BqKind[] = ['lowshelf', 'peak', 'peak', 'peak', 'highshelf']
+
+/**
+ * Transition of the recursion y[n] = -a1*y[n-1] - a2*y[n-2] over one whole chunk of `len` samples,
+ * in (value, slope) coordinates: a state (y1, y2) = p*(1,1) + d*(0,-1), p = y1, d = y1 - y2.
+ * Returns [MP.y1, MP.y2, MD.y1, MD.y2] — the end state (y[len-1], y[len-2]) for p = 1 / d = 1.
+ * Float64 here: the EQ shader's carry needs it exact (see EQ5_WGSL).
+ */
+export function chunkTransition(a1: number, a2: number, len: number): number[] {
+  const run = (y1: number, y2: number): [number, number] => {
+    for (let k = 0; k < len; k++) {
+      const y = -a1 * y1 - a2 * y2
+      y2 = y1
+      y1 = y
+    }
+    return [y1, y2]
+  }
+  const p = run(1, 1)
+  const d = run(0, -1)
+  return [p[0], p[1], d[0], d[1]]
+}
 
 /**
  * Digital 5-band parametric EQ insert — 5 RBJ biquads in series per channel
@@ -35,13 +55,13 @@ export class Eq5Insert implements Insert {
   private pipeline: GPUComputePipeline | null = null
   private ubo: GPUBuffer
   private state: GPUBuffer
-  private ab = new ArrayBuffer(128)
+  private ab = new ArrayBuffer(192)
   private u32 = new Uint32Array(this.ab)
   private f32 = new Float32Array(this.ab)
 
   constructor() {
     const { device } = getGpu()
-    this.ubo = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+    this.ubo = device.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
     this.state = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
   }
 
@@ -67,7 +87,9 @@ export class Eq5Insert implements Insert {
     this.u32[0] = io.blockFrames
     for (let k = 0; k < 5; k++) {
       const b = this.bands[k]
-      this.f32.set(biquad(KINDS[k], io.sampleRate, b.freq, b.q, b.gainDb), 2 + k * 5)
+      const c = biquad(KINDS[k], io.sampleRate, b.freq, b.q, b.gainDb)
+      this.f32.set(c, 2 + k * 5)
+      this.f32.set(chunkTransition(Math.fround(c[3]), Math.fround(c[4]), Math.ceil(io.blockFrames / 256)), 28 + k * 4)
     }
     device.queue.writeBuffer(this.ubo, 0, this.ab)
 
@@ -83,7 +105,7 @@ export class Eq5Insert implements Insert {
     const pass = enc.beginComputePass({ label: 'eq5' })
     pass.setPipeline(pipe)
     pass.setBindGroup(0, bind)
-    pass.dispatchWorkgroups(1)
+    pass.dispatchWorkgroups(2) // one 256-thread workgroup per channel
     pass.end()
   }
 }

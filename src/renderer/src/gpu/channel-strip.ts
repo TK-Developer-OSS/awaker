@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -23,7 +23,7 @@ export interface StripComp {
   makeupDb: number
 }
 
-/** Saturation voicing: parallel multiband ("SSL-ish" forward grit) or transformer + Class-A ("Neve-ish" warmth). */
+/** Saturation voicing: parallel multiband ("SL-ish" forward grit) or transformer + Class-A ("NV-ish" warmth). */
 export type SatMode = 'drive' | 'color'
 
 export interface ChannelStripParams {
@@ -68,8 +68,6 @@ const FLAG_COMP = 16
 
 /** f32 words per track slot — CS struct pads to 256 B, state slice is the same 64. */
 const STRIP_WORDS = 64
-/** Invocations per workgroup in the batched strip pass (one warp; one track each). */
-const STRIP_WG = 32
 
 type BqKind = Parameters<typeof biquad>[0]
 
@@ -118,6 +116,16 @@ export class ChannelStrip {
     return !this.bypass && (this.flags() !== 0 || Math.abs(this.params.trimDb) >= 0.01)
   }
 
+  /** True when this strip's saturation is DRIVE mode (triode + feedback comp) — runs on the parallel drive kernels. */
+  wouldDriveFast(): boolean {
+    return this.wouldProcess() && this.params.drive > 0.001 && this.params.satMode !== 'color'
+  }
+
+  /** True when this strip's compressor stage runs (lets the bank skip the comp passes when no track needs them). */
+  wouldCompress(): boolean {
+    return this.wouldProcess() && this.params.comp.on
+  }
+
   /**
    * Bake this strip's coefficients into `u` / `f` (aliased views of one buffer)
    * starting at word `B` (= slot * STRIP_WORDS), for sample rate `fs`. Mirrors
@@ -138,7 +146,7 @@ export class ChannelStrip {
     f[B + 60] = this.vary.allpass
 
     // --- DRIVE mode — 12AX7 triode grit + feedback FET compressor (see
-    //     driveStage in CHANNELSTRIP_WGSL). Voiced after an 1176 with all four
+    //     driveA / driveB in CHANNELSTRIP_WGSL). Voiced after a 76-type FET comp with all four
     //     ratio buttons in ("British mode"), used to shove a kick / bass forward:
     //     one knob drives hard into a bright, ragged asymmetric triode clip
     //     ("ささくれ"), then a very fast feedback compressor at extreme ratio
@@ -203,7 +211,7 @@ export class ChannelStrip {
     f[B + 18] = 0 // _dpad
     f[B + 56] = 0 // _dpad2
 
-    // --- COLOR mode — one-knob transformer + Class-A (see colorStage in WGSL). ---
+    // --- COLOR mode — one-knob transformer + Class-A (see preA in CHANNELSTRIP_WGSL). ---
     // DC-block → LF bloom (weight / 2nd) → HF pre-emphasis → asymmetric Class-A
     // (bias = 2nd, tanh = 3rd) → output shoulder + half-direct top (sparkle).
     // Unity at amount 0. `vary` nudges gain / bias / HF corner per instance.
@@ -276,7 +284,12 @@ export class ChannelStrip {
  * `state` is zeroed by `reset()` at transport start (comp gain → unity).
  */
 export class StripBank {
-  private pipeline: GPUComputePipeline | null = null
+  private bgl: GPUBindGroupLayout | null = null
+  private pipes: Record<'preA' | 'driveA' | 'driveB' | 'tailC' | 'compEnv' | 'compTg' | 'compGain' | 'compApply', GPUComputePipeline> | null = null
+  private scratch: GPUBuffer | null = null // comp scratch, [track][frame]
+  private scratchFloats = 0
+  private driveScratch: GPUBuffer | null = null // DRIVE fast path scratch, [track*2+ch][frame]
+  private driveFloats = 0
   private params: GPUBuffer | null = null
   private state: GPUBuffer | null = null
   private readonly batchUbo: GPUBuffer
@@ -318,8 +331,8 @@ export class StripBank {
     this.reset()
   }
 
-  private getPipeline(): GPUComputePipeline {
-    if (!this.pipeline) {
+  private getPipes(): NonNullable<StripBank['pipes']> {
+    if (!this.pipes) {
       const { device } = getGpu()
       const module = device.createShaderModule({ code: CHANNELSTRIP_WGSL })
       // Surface WGSL errors/warnings explicitly (createComputePipeline itself
@@ -330,13 +343,32 @@ export class StripBank {
           console.error(`[strip-bank WGSL ${m.type}] ${m.lineNum}:${m.linePos} ${m.message}`)
         }
       })
-      this.pipeline = device.createComputePipeline({
-        label: 'channel-strip-bank',
-        layout: 'auto',
-        compute: { module, entryPoint: 'main' }
+      const V = GPUShaderStage.COMPUTE
+      this.bgl = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: V, buffer: { type: 'read-only-storage' } },
+          { binding: 1, visibility: V, buffer: { type: 'storage' } },
+          { binding: 2, visibility: V, buffer: { type: 'storage' } },
+          { binding: 3, visibility: V, buffer: { type: 'uniform' } },
+          { binding: 4, visibility: V, buffer: { type: 'storage' } },
+          { binding: 5, visibility: V, buffer: { type: 'storage' } }
+        ]
       })
+      const layout = device.createPipelineLayout({ bindGroupLayouts: [this.bgl] })
+      const mk = (entryPoint: string, label: string): GPUComputePipeline =>
+        device.createComputePipeline({ label: `channel-strip-bank.${label}`, layout, compute: { module, entryPoint } })
+      this.pipes = {
+        preA: mk('preA', 'preA'),
+        driveA: mk('driveA', 'driveA'),
+        driveB: mk('driveB', 'driveB'),
+        tailC: mk('tailC', 'tailC'),
+        compEnv: mk('compEnv', 'compEnv'),
+        compTg: mk('compTg', 'compTg'),
+        compGain: mk('compGain', 'compGain'),
+        compApply: mk('compApply', 'compApply')
+      }
     }
-    return this.pipeline
+    return this.pipes
   }
 
   /** Zero every track's DSP state (filter memory, envelopes); comp gain → unity. */
@@ -379,24 +411,63 @@ export class StripBank {
     device.queue.writeBuffer(this.params!, 0, this.ab, 0, n * STRIP_WORDS * 4)
     device.queue.writeBuffer(this.batchUbo, 0, new Uint32Array([n, blockFrames]))
 
-    const pipe = this.getPipeline()
+    const pipes = this.getPipes()
+    const need = n * blockFrames
+    if (!this.scratch || this.scratchFloats < need) {
+      this.scratch?.destroy()
+      this.scratch = device.createBuffer({ label: 'strip-bank.comp', size: need * 4, usage: GPUBufferUsage.STORAGE })
+      this.scratchFloats = need
+      this.bind = null
+    }
+    const needD = n * 2 * blockFrames
+    if (!this.driveScratch || this.driveFloats < needD) {
+      this.driveScratch?.destroy()
+      this.driveScratch = device.createBuffer({ label: 'strip-bank.drive', size: needD * 4, usage: GPUBufferUsage.STORAGE })
+      this.driveFloats = needD
+      this.bind = null
+    }
     if (!this.bind || this.boundSig !== bigSig) {
       this.bind = device.createBindGroup({
-        layout: pipe.getBindGroupLayout(0),
+        layout: this.bgl!,
         entries: [
           { binding: 0, resource: { buffer: this.params! } },
           { binding: 1, resource: { buffer: bigSig } },
           { binding: 2, resource: { buffer: this.state! } },
-          { binding: 3, resource: { buffer: this.batchUbo } }
+          { binding: 3, resource: { buffer: this.batchUbo } },
+          { binding: 4, resource: { buffer: this.scratch } },
+          { binding: 5, resource: { buffer: this.driveScratch! } }
         ]
       })
       this.boundSig = bigSig
     }
 
+    const frameGroups = Math.ceil(blockFrames / 256)
     const pass = enc.beginComputePass({ label: 'channel-strip-bank' })
-    pass.setPipeline(pipe)
     pass.setBindGroup(0, this.bind)
-    pass.dispatchWorkgroups(Math.ceil(n / STRIP_WG))
+    // Drive-mode tracks go through driveA/driveB; Color-mode and plain (no saturation) tracks through
+    // preA; everything ends in tailC. Kernels return at once for tracks they don't own.
+    if (strips.some((s) => s?.wouldProcess() && !s.wouldDriveFast())) {
+      pass.setPipeline(pipes.preA)
+      pass.dispatchWorkgroups(n * 2)
+    }
+    if (strips.some((s) => s?.wouldDriveFast())) {
+      pass.setPipeline(pipes.driveA)
+      pass.dispatchWorkgroups(n * 2)
+      pass.setPipeline(pipes.driveB)
+      pass.dispatchWorkgroups(n * 2)
+    }
+    pass.setPipeline(pipes.tailC)
+    pass.dispatchWorkgroups(n * 2)
+    if (strips.some((s) => s?.wouldCompress())) {
+      pass.setPipeline(pipes.compEnv)
+      pass.dispatchWorkgroups(n)
+      pass.setPipeline(pipes.compTg)
+      pass.dispatchWorkgroups(frameGroups, n)
+      pass.setPipeline(pipes.compGain)
+      pass.dispatchWorkgroups(n)
+      pass.setPipeline(pipes.compApply)
+      pass.dispatchWorkgroups(frameGroups, n)
+    }
     pass.end()
     return true
   }

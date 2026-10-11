@@ -1,9 +1,9 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
 import { getGpu } from '../device'
-import { REVERB_WGSL } from '../shaders'
+import { REVERB_AP_WGSL, REVERB_COMB_WGSL } from '../shaders'
 import type { BlockIO, Insert } from '../insert'
 
 // Freeverb tunings at 44.1 kHz (Jezar). Scaled to the project sample rate.
@@ -22,9 +22,9 @@ export interface ReverbParams {
 }
 
 /**
- * GPU insert reverb. One thread per channel runs the Freeverb recurrence
- * serially over the block (see REVERB_WGSL for why). State buffers persist
- * across blocks; `reset()` zeroes them.
+ * GPU insert reverb (Freeverb). Two compute passes, parallel across comb / sample chunks and
+ * numerically equal to the plain serial recurrence (see REVERB_COMB_WGSL). State buffers
+ * persist across blocks; `reset()` zeroes them.
  */
 export class ReverbInsert implements Insert {
   readonly name = 'reverb'
@@ -33,7 +33,10 @@ export class ReverbInsert implements Insert {
   // wet + dry form a single Dry↔Wet balance in the UI (dry = 1 - wet).
   params: ReverbParams = { roomSize: 0.72, damp: 0.35, wet: 0.32, dry: 0.68 }
 
-  private pipeline: GPUComputePipeline | null = null
+  private combPipe: GPUComputePipeline | null = null
+  private apPipe: GPUComputePipeline | null = null
+  private scratch: GPUBuffer | null = null
+  private scratchFrames = 0
   private sr = 0
   private combLen: number[] = []
   private apLen: number[] = []
@@ -97,16 +100,30 @@ export class ReverbInsert implements Insert {
     this.reset()
   }
 
-  private getPipeline(): GPUComputePipeline {
-    if (!this.pipeline) {
+  private pipelines(): { comb: GPUComputePipeline; ap: GPUComputePipeline } {
+    if (!this.combPipe || !this.apPipe) {
       const { device } = getGpu()
-      this.pipeline = device.createComputePipeline({
-        label: 'reverb',
-        layout: 'auto',
-        compute: { module: device.createShaderModule({ code: REVERB_WGSL }), entryPoint: 'main' }
-      })
+      const make = (label: string, code: string): GPUComputePipeline =>
+        device.createComputePipeline({
+          label,
+          layout: 'auto',
+          compute: { module: device.createShaderModule({ code }), entryPoint: 'main' }
+        })
+      this.combPipe = make('reverb.comb', REVERB_COMB_WGSL)
+      this.apPipe = make('reverb.allpass', REVERB_AP_WGSL)
     }
-    return this.pipeline
+    return { comb: this.combPipe, ap: this.apPipe }
+  }
+
+  /** 16 comb outputs + 2 channel accumulators, one block long each. */
+  private ensureScratch(blockFrames: number): GPUBuffer {
+    if (!this.scratch || this.scratchFrames < blockFrames) {
+      const { device } = getGpu()
+      this.scratch?.destroy()
+      this.scratch = device.createBuffer({ label: 'reverb.scratch', size: 18 * blockFrames * 4, usage: GPUBufferUsage.STORAGE })
+      this.scratchFrames = blockFrames
+    }
+    return this.scratch
   }
 
   reset(): void {
@@ -132,23 +149,41 @@ export class ReverbInsert implements Insert {
     new Float32Array(u, 8, 6).set([feedback, damp1, 1 - damp1, 0.5, wet, dry])
     device.queue.writeBuffer(this.ubo, 0, u)
 
-    const pipe = this.getPipeline()
-    const bind = device.createBindGroup({
-      layout: pipe.getBindGroupLayout(0),
+    const { comb, ap } = this.pipelines()
+    const scratch = this.ensureScratch(io.blockFrames)
+    const buf = (b: GPUBuffer): GPUBindingResource => ({ buffer: b })
+    // 'auto' layouts only contain the bindings a pass uses, so each pass gets exactly its own entries
+    const combBind = device.createBindGroup({
+      layout: comb.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: this.ubo } },
-        { binding: 1, resource: { buffer: this.cfgBuf! } },
-        { binding: 2, resource: { buffer: io.sig } }, // planar [L | R]
-        { binding: 3, resource: { buffer: this.combBuf! } },
-        { binding: 4, resource: { buffer: this.apBuf! } },
-        { binding: 5, resource: { buffer: this.lpfBuf! } }
+        { binding: 0, resource: buf(this.ubo) },
+        { binding: 1, resource: buf(this.cfgBuf!) },
+        { binding: 2, resource: buf(io.sig) }, // planar [L | R]
+        { binding: 3, resource: buf(this.combBuf!) },
+        { binding: 5, resource: buf(this.lpfBuf!) },
+        { binding: 6, resource: buf(scratch) }
       ]
     })
-    // workgroup_size(2): invocation 0 processes L, invocation 1 processes R.
-    const pass = enc.beginComputePass({ label: 'reverb' })
-    pass.setPipeline(pipe)
-    pass.setBindGroup(0, bind)
-    pass.dispatchWorkgroups(1)
-    pass.end()
+    const apBind = device.createBindGroup({
+      layout: ap.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: buf(this.ubo) },
+        { binding: 1, resource: buf(this.cfgBuf!) },
+        { binding: 2, resource: buf(io.sig) },
+        { binding: 4, resource: buf(this.apBuf!) },
+        { binding: 6, resource: buf(scratch) }
+      ]
+    })
+    // pass 1: 16 workgroups (channel x comb); pass 2: 2 workgroups (channel) — allpass chain + wet/dry
+    const p1 = enc.beginComputePass({ label: 'reverb.comb' })
+    p1.setPipeline(comb)
+    p1.setBindGroup(0, combBind)
+    p1.dispatchWorkgroups(16)
+    p1.end()
+    const p2 = enc.beginComputePass({ label: 'reverb.allpass' })
+    p2.setPipeline(ap)
+    p2.setBindGroup(0, apBind)
+    p2.dispatchWorkgroups(2)
+    p2.end()
   }
 }

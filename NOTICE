@@ -1,7 +1,26 @@
 Awaker DAW over GPU
-Copyright 2026 @TK_Developer and Awaker DAW over GPU contributors
+Copyright 2026 TK and Awaker DAW over GPU contributors (https://x.com/TK_Developer)
 
 This product includes software developed by the Awaker DAW over GPU project
-and its contributors.
+and its contributors (TK, https://x.com/TK_Developer).
 
 Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+Audio input / output (native/audio):
+  - RtAudio, Copyright (c) 2001-2023 Gary P. Scavone, MIT-style licence
+    (native/audio/vendor/rtaudio/LICENSE).
+  - cwASIO, Copyright (c) 2024 Stefan Heinzmann, MIT licence (native/audio/vendor/cwasio/LICENSE):
+    an independent implementation of the ASIO driver API. It contains no code from Steinberg's
+    ASIO SDK. It is built only into the optional ASIO add-on file (awaker_audio_asio.node), which is
+    distributed separately from the main package; the main package's audio module is WASAPI only and
+    contains no ASIO code.
+  - Node-API headers (native/audio/vendor/node-api): MIT, the Node.js project.
+  This repository contains no code from Steinberg's ASIO SDK.
+
+Optional fallback: the npm package `audify` (MIT) is listed as an optional dependency and is used only
+when the module above has not been built. Its Windows binary is built with Steinberg's ASIO host
+headers (ASIO SDK 2.3, (c) 1997-2013 Steinberg Media Technologies GmbH); if you redistribute a build
+that includes it, check Steinberg's ASIO licensing (a signed agreement, or the GPLv3 option):
+https://www.steinberg.net/developers/
+
+ASIO is a trademark of Steinberg Media Technologies GmbH.

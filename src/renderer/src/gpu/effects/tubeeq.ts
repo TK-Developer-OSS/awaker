@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -7,7 +7,7 @@ import { TUBEEQ_WGSL } from '../shaders'
 import { biquad } from '../biquad'
 import type { BlockIO, Insert } from '../insert'
 
-/** EQP-1A front-panel frequency switch positions (Hz). Exposed for the UI. */
+/** EQ1 front-panel frequency switch positions (Hz). Exposed for the UI. */
 export const TUBEEQ_LOW_FREQS = [20, 30, 60, 100]
 export const TUBEEQ_HI_BOOST_FREQS = [3000, 4000, 5000, 8000, 10000, 12000, 16000]
 export const TUBEEQ_HI_ATTEN_FREQS = [5000, 10000, 20000]
@@ -19,7 +19,7 @@ export interface TubeEqParams {
   /** dB into the input 12AX7. ~clean at 0, breaks up when pushed. */
   inputGainDb: number
   lowFreq: number
-  /** Low-shelf boost, 0..10 (Pultec-style dial). Voiced 1.5× hotter than an EQP-1A. */
+  /** Low-shelf boost, 0..10 (Tube-style dial). Voiced 1.5× hotter than an EQ1. */
   lowBoost: number
   /** Low-shelf atten, 0..10. Boost + atten together = the classic curve. */
   lowAtten: number
@@ -36,7 +36,7 @@ export interface TubeEqParams {
 }
 
 /**
- * Tube program EQ — a Pultec EQP-1A homage.
+ * Tube program EQ.
  *
  *   input 12AX7 (gain stage + cathode follower — a 12AX7 is a dual triode)
  *   → passive program EQ (4 RBJ biquads; 0 = mathematical passthrough)
@@ -154,7 +154,7 @@ export class TubeEqInsert implements Insert {
     const p = this.params
     const fs = io.sampleRate
 
-    // Pultec dials (0..10) → dB. Ranges roughly match an EQP-1A, except the low
+    // Tube dials (0..10) → dB. Ranges roughly match an EQ1, except the low
     // boost, which the user wants 1.5× hotter (13.5 → ~20 dB at 10).
     const lowBoostDb = (p.lowBoost / 10) * 13.5 * 1.5
     const lowAttenDb = (p.lowAtten / 10) * 17

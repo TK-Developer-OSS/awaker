@@ -1,9 +1,9 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
 import { getGpu } from '../device'
-import { DELAY_WGSL } from '../shaders'
+import { DELAY_SERIAL_WGSL, DELAY_WGSL } from '../shaders'
 import type { BlockIO, Insert } from '../insert'
 
 /** Longest delay time the line is sized for. */
@@ -36,6 +36,9 @@ export class DelayInsert implements Insert {
   params: DelayParams = { timeMs: 300, feedback: 0.35, damp: 0.3, wet: 0.25, dry: 0.75, pingpong: false }
 
   private pipeline: GPUComputePipeline | null = null
+  private serialPipe: GPUComputePipeline | null = null
+  private scratch: GPUBuffer | null = null
+  private scratchFrames = 0
   private sr = 0
   private lineLen = 0
   private ubo: GPUBuffer
@@ -69,16 +72,27 @@ export class DelayInsert implements Insert {
     this.reset()
   }
 
-  private getPipeline(): GPUComputePipeline {
-    if (!this.pipeline) {
-      const { device } = getGpu()
-      this.pipeline = device.createComputePipeline({
-        label: 'delay',
+  /** Parallel chunked version; very short delays (< 256 samples) keep the serial one, where chunks would be tiny. */
+  private getPipeline(parallel: boolean): GPUComputePipeline {
+    const { device } = getGpu()
+    const make = (label: string, code: string): GPUComputePipeline =>
+      device.createComputePipeline({
+        label,
         layout: 'auto',
-        compute: { module: device.createShaderModule({ code: DELAY_WGSL }), entryPoint: 'main' }
+        compute: { module: device.createShaderModule({ code }), entryPoint: 'main' }
       })
+    if (parallel) return (this.pipeline ??= make('delay', DELAY_WGSL))
+    return (this.serialPipe ??= make('delay.serial', DELAY_SERIAL_WGSL))
+  }
+
+  private ensureScratch(blockFrames: number): GPUBuffer {
+    if (!this.scratch || this.scratchFrames < blockFrames) {
+      const { device } = getGpu()
+      this.scratch?.destroy()
+      this.scratch = device.createBuffer({ label: 'delay.scratch', size: 2 * blockFrames * 4, usage: GPUBufferUsage.STORAGE })
+      this.scratchFrames = blockFrames
     }
-    return this.pipeline
+    return this.scratch
   }
 
   reset(): void {
@@ -111,16 +125,16 @@ export class DelayInsert implements Insert {
     this.f32[8] = p.pingpong ? 1 : 0
     device.queue.writeBuffer(this.ubo, 0, this.ab)
 
-    const pipe = this.getPipeline()
-    const bind = device.createBindGroup({
-      layout: pipe.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.ubo } },
-        { binding: 1, resource: { buffer: io.sig } },
-        { binding: 2, resource: { buffer: this.line! } },
-        { binding: 3, resource: { buffer: this.lpst! } }
-      ]
-    })
+    const parallel = delaySamples >= 256
+    const pipe = this.getPipeline(parallel)
+    const entries: GPUBindGroupEntry[] = [
+      { binding: 0, resource: { buffer: this.ubo } },
+      { binding: 1, resource: { buffer: io.sig } },
+      { binding: 2, resource: { buffer: this.line! } },
+      { binding: 3, resource: { buffer: this.lpst! } }
+    ]
+    if (parallel) entries.push({ binding: 4, resource: { buffer: this.ensureScratch(io.blockFrames) } })
+    const bind = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries })
     const pass = enc.beginComputePass({ label: 'delay' })
     pass.setPipeline(pipe)
     pass.setBindGroup(0, bind)

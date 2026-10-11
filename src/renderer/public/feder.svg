@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 TK <tk.oss.developer@gmail.com>
+  SPDX-License-Identifier: Apache-2.0
+  Generated with Claude Code (https://claude.com/claude-code)
+
+  Mixer fader cap, drawn from scratch as vector shapes (no photographic or raster data). It
+  replaces the old 28x56 feder.png, which was a small photo-derived bitmap. 28 x 56 units, the
+  same 1:2 shape; the page shows it at 25 x 50 px, and it stays sharp at any size.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 56" width="28" height="56">
+  <defs>
+    <!-- upper half: bright ivory; lower half: a step darker, like a cap lit from above -->
+    <linearGradient id="capTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4f3ea"/>
+      <stop offset="1" stop-color="#e2e1d6"/>
+    </linearGradient>
+    <linearGradient id="capBottom" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c9c8bd"/>
+      <stop offset="1" stop-color="#b3b2a7"/>
+    </linearGradient>
+    <!-- soft vertical shading toward the left / right edges (the cap is slightly rounded) -->
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#000" stop-opacity="0.22"/>
+      <stop offset="0.14" stop-color="#000" stop-opacity="0"/>
+      <stop offset="0.86" stop-color="#000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.26"/>
+    </linearGradient>
+    <!-- neutral grey at the four corners: a little grey where the cap turns the corner reads as rounder -->
+    <radialGradient id="ctl" gradientUnits="userSpaceOnUse" cx="2" cy="2.5" r="9">
+      <stop offset="0" stop-color="#303030" stop-opacity="0.7"/>
+      <stop offset="0.55" stop-color="#303030" stop-opacity="0.3"/>
+      <stop offset="1" stop-color="#303030" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ctr" gradientUnits="userSpaceOnUse" cx="26" cy="2.5" r="9">
+      <stop offset="0" stop-color="#303030" stop-opacity="0.7"/>
+      <stop offset="0.55" stop-color="#303030" stop-opacity="0.3"/>
+      <stop offset="1" stop-color="#303030" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cbl" gradientUnits="userSpaceOnUse" cx="2" cy="53.5" r="9">
+      <stop offset="0" stop-color="#303030" stop-opacity="0.7"/>
+      <stop offset="0.55" stop-color="#303030" stop-opacity="0.3"/>
+      <stop offset="1" stop-color="#303030" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cbr" gradientUnits="userSpaceOnUse" cx="26" cy="53.5" r="9">
+      <stop offset="0" stop-color="#303030" stop-opacity="0.7"/>
+      <stop offset="0.55" stop-color="#303030" stop-opacity="0.3"/>
+      <stop offset="1" stop-color="#303030" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="body"><rect x="2" y="2.5" width="24" height="51" rx="2.8"/></clipPath>
+  </defs>
+
+  <!-- dark rim / slot shadow -->
+  <rect x="0.5" y="0.5" width="27" height="55" rx="3.8" fill="#2b2b28" stroke="#161614" stroke-width="1"/>
+
+  <g clip-path="url(#body)">
+    <rect x="2" y="2.5" width="24" height="25.5" fill="url(#capTop)"/>
+    <rect x="2" y="28" width="24" height="25.5" fill="url(#capBottom)"/>
+
+    <!-- grip ridges: a dark groove with a light lip under it, repeated down each half -->
+    <g fill="#8a8977" opacity="0.7">
+      <rect x="2" y="7"  width="24" height="0.9"/>
+      <rect x="2" y="12" width="24" height="0.9"/>
+      <rect x="2" y="17" width="24" height="0.9"/>
+      <rect x="2" y="22" width="24" height="0.9"/>
+    </g>
+    <g fill="#ffffff" opacity="0.55">
+      <rect x="2" y="7.9"  width="24" height="0.7"/>
+      <rect x="2" y="12.9" width="24" height="0.7"/>
+      <rect x="2" y="17.9" width="24" height="0.7"/>
+      <rect x="2" y="22.9" width="24" height="0.7"/>
+    </g>
+    <g fill="#6f6e5f" opacity="0.6">
+      <rect x="2" y="33" width="24" height="0.9"/>
+      <rect x="2" y="38" width="24" height="0.9"/>
+      <rect x="2" y="43" width="24" height="0.9"/>
+      <rect x="2" y="48" width="24" height="0.9"/>
+    </g>
+    <g fill="#e8e7dc" opacity="0.45">
+      <rect x="2" y="33.9" width="24" height="0.7"/>
+      <rect x="2" y="38.9" width="24" height="0.7"/>
+      <rect x="2" y="43.9" width="24" height="0.7"/>
+      <rect x="2" y="48.9" width="24" height="0.7"/>
+    </g>
+
+    <!-- top / bottom bevel -->
+    <rect x="2" y="2.5" width="24" height="1.2" fill="#fff" opacity="0.6"/>
+    <rect x="2" y="52.3" width="24" height="1.2" fill="#fff" opacity="0.35"/>
+
+    <!-- corner grey -->
+    <rect x="2" y="2.5" width="9" height="9" fill="url(#ctl)"/>
+    <rect x="17" y="2.5" width="9" height="9" fill="url(#ctr)"/>
+    <rect x="2" y="44.5" width="9" height="9" fill="url(#cbl)"/>
+    <rect x="17" y="44.5" width="9" height="9" fill="url(#cbr)"/>
+
+    <!-- rounded-edge shading over everything -->
+    <rect x="2" y="2.5" width="24" height="51" fill="url(#edge)"/>
+  </g>
+
+  <!-- the black index line across the middle, with a pale notch at each end on the rim -->
+  <rect x="2" y="26.6" width="24" height="2.6" fill="#050505"/>
+  <rect x="0.5" y="26.9" width="2" height="2" fill="#7c7c75"/>
+  <rect x="25.5" y="26.9" width="2" height="2" fill="#7c7c75"/>
+</svg>

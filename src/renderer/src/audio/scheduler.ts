@@ -1,10 +1,11 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
 import type { AudioOutStatus, RecChunk } from '../../../preload/index'
 import { Recorder, type RecTarget, type Take } from './recorder'
-import { MasterBus, type MixSource } from '../gpu/master-bus'
+import { LiveBus } from './live-bus'
+import { MasterBus, type MixGroup, type MixSource } from '../gpu/master-bus'
 import { state, update } from '../state'
 
 /**
@@ -54,7 +55,7 @@ const LUFS_ABS_GATE_POWER = Math.pow(10, (-70 + 0.691) / 10)
 // dev machine the readout still sat low vs. commercial masters, so a flat trim is
 // added to every displayed LUFS value (Momentary / Short-term / Integrated / Max)
 // until it's checked against a certified reference — then adjust or drop to 0.
-// See README session log 2026-09-07(6) follow-up.
+// See DEVELOP session log 2026-09-07(6) follow-up.
 const LUFS_CALIB_DB = 2.0
 
 export interface BounceResult {
@@ -72,6 +73,8 @@ export interface BounceResult {
   renderMs: number
   audio: Float32Array | null
 }
+
+const EMPTY_PEAKS = new Float32Array(0)
 
 export class PlaybackScheduler {
   readonly masterBus: MasterBus
@@ -101,8 +104,28 @@ export class PlaybackScheduler {
   /** Last status' input info, for UI / MCP. */
   inputChannels = 0
   inputError = ''
+
+  // --- live (line-input) monitoring ---
+  /** Set by the host: the small-block path that runs line-input lanes through strip + inserts. */
+  liveBus: LiveBus | null = null
+  /** Live-path counters from main's last status (null before the first one). */
+  liveStatus: AudioOutStatus['live'] | null = null
+  /** Test / no-interface input for the live path: false = hardware, true = tones, 'impulse' = click train. */
+  liveSynthetic: boolean | 'impulse' = false
+  private liveLateSeen = 0
+  private liveBumpAt = 0
+  /** The user wants the device kept open for monitoring while the transport is stopped. */
+  private monitorWanted = false
+  /** A monitor-only stream (no transport) is currently open. */
+  monitoring = false
+  /** Device round trip (input + output latency, frames) of the stream a take is being recorded on. */
+  private recLatencyFrames = 0
+  /** Extra shift for recorded takes (ms, positive = earlier), for a measured loopback / interface offset. */
+  recOffsetMs = 0
   /** Peak of the most recently rendered master block (post master-gain, ±1). */
   private masterBlockPeak = 0
+  /** Post-fader peak (linear) of every lane in the last rendered block, in lane order (0 for lanes with no clips). */
+  private laneBlockPeaks: Float32Array = new Float32Array(0)
 
   // --- LUFS meter state (see meterBlock) ---
   private lufsSr = 0
@@ -124,7 +147,23 @@ export class PlaybackScheduler {
     this.masterBus = new MasterBus()
   }
 
+  /** Group channels (buses); set by the host. A source's `group` indexes this array. */
+  getGroups: () => MixGroup[] = () => []
+  /** Post-fader peak (linear) of each group in the block being played, in `getGroups()` order. */
+  private groupBlockPeaks: Float32Array = new Float32Array(0)
+
   /** Lanes that have at least one placed clip (mute is a gain-0 mix, not a filter). */
+  /** Map the bus's per-source peaks (only lanes with clips are rendered) back to lane order. */
+  private captureLanePeaks(): void {
+    const all = this.getSources()
+    const bus = this.masterBus.trackPeaks
+    const out = new Float32Array(all.length)
+    let k = 0
+    for (let i = 0; i < all.length; i++) if (all[i].clips.length > 0) out[i] = bus[k++] ?? 0
+    this.laneBlockPeaks = out
+    this.groupBlockPeaks = this.masterBus.groupPeaks.slice()
+  }
+
   private ready(): MixSource[] {
     return this.getSources().filter((s) => s.clips.length > 0)
   }
@@ -142,7 +181,7 @@ export class PlaybackScheduler {
   /** Compile the master pipeline ahead of the first Play (avoids a startup gap). */
   async warmup(): Promise<void> {
     const src = this.ready()
-    if (src.length) await this.masterBus.renderBlock(src, 0, 256, state.sampleRate)
+    if (src.length) await this.masterBus.renderBlock(src, 0, 256, state.sampleRate, this.getGroups())
   }
 
   onStatus(s: AudioOutStatus): void {
@@ -157,6 +196,18 @@ export class PlaybackScheduler {
     this.deviceName = s.deviceName
     this.inputChannels = s.inputChannels
     this.inputError = s.inputError
+    this.liveStatus = s.live
+    // Automatic latency: a block that missed its output frame means the margin is too tight — widen
+    // it a little (at most once a second; a manual value is left alone).
+    const lb = this.liveBus
+    if (lb && s.live.enabled && !lb.latencyMs) {
+      const now = performance.now()
+      if (s.live.late > this.liveLateSeen && now - this.liveBumpAt > 1000) {
+        lb.bumpAuto()
+        this.liveBumpAt = now
+      }
+    }
+    this.liveLateSeen = s.live.late
   }
 
   get recording(): boolean {
@@ -332,6 +383,10 @@ export class PlaybackScheduler {
     backend: string
     deviceName: string
     masterPeak: number
+    /** Post-fader peak of each lane (linear, lane order) in the block being played; empty when stopped. */
+    trackPeaks: Float32Array
+    /** Post-fader peak of each group channel (linear, `getGroups()` order); empty when stopped. */
+    groupPeaks: Float32Array
     lufsM: number
     lufsS: number
     lufsI: number
@@ -345,6 +400,8 @@ export class PlaybackScheduler {
       backend: this.backend,
       deviceName: this.deviceName,
       masterPeak: live ? this.masterBlockPeak : 0,
+      trackPeaks: live ? this.laneBlockPeaks : EMPTY_PEAKS,
+      groupPeaks: live ? this.groupBlockPeaks : EMPTY_PEAKS,
       lufsM: live ? this.momLufs() : -Infinity,
       lufsS: live ? this.stLufs() : -Infinity,
       // Integrated + Max stay readable after Stop (they describe the whole take).
@@ -359,6 +416,92 @@ export class PlaybackScheduler {
    * level / loudness statistics. Same state resets as a Play so runs are comparable.
    * `tailSeconds` renders past the last clip so reverb / delay tails are included.
    */
+  /**
+   * Offline render of the given sources only (a stem / one channel) through the same GPU path as the master,
+   * returning interleaved stereo. `masterChain: false` leaves the master insert chain and the master fader out
+   * (what a standard channel export gives). `frames` null = to the end of the last clip of ALL ready lanes + tail,
+   * so every stem has the same length and they line up.
+   */
+  async renderOffline(
+    sources: MixSource[],
+    o: {
+      startFrame: number
+      frames: number | null
+      tailSeconds: number
+      masterChain: boolean
+      groups?: MixGroup[]
+      /** false = do not keep the render (the returned `audio` is empty): for analysis, which reads it through onBlock. */
+      keepAudio?: boolean
+      /** Every rendered block (interleaved stereo, `frames` valid frames) as it comes. */
+      onBlock?: (block: Float32Array, frames: number) => void
+    }
+  ): Promise<{ audio: Float32Array; frames: number; peak: number[]; clippedFrames: number; renderMs: number }> {
+    if (state.playing || this.rec) throw new Error('stop transport before exporting')
+    if (this.tailing) await this.finish()
+    const sr = state.sampleRate
+    const from = Math.max(0, Math.floor(o.startFrame))
+    const frames = Math.max(0, o.frames ?? this.totalFrames() - from + Math.floor(o.tailSeconds * sr))
+    this.masterBus.resetInserts()
+    this.masterBus.resetStrips()
+    for (const s of this.getSources()) s.inserts?.forEach((fx) => fx.reset())
+    const savedGain = this.masterBus.masterGain
+    if (!o.masterChain) {
+      this.masterBus.masterGain = 1
+      this.masterBus.skipMasterChain = true
+      this.masterBus.skipFinalClamp = true // a stem keeps its headroom (a float export may exceed full scale)
+    }
+    const keep = o.keepAudio !== false
+    const audio = new Float32Array(keep ? frames * 2 : 0)
+    const pk = [0, 0]
+    let clipped = 0
+    const t0 = performance.now()
+    try {
+      for (let pos = 0; pos < frames; pos += BLOCK_FRAMES) {
+        const block = await this.masterBus.renderBlock(sources, from + pos, BLOCK_FRAMES, sr, o.groups ?? [])
+        const n = Math.min(BLOCK_FRAMES, frames - pos)
+        for (let i = 0; i < n; i++) {
+          const l = block[i * 2]
+          const r = block[i * 2 + 1]
+          const al = l < 0 ? -l : l
+          const ar = r < 0 ? -r : r
+          if (al > pk[0]) pk[0] = al
+          if (ar > pk[1]) pk[1] = ar
+          if (al >= 1 || ar >= 1) clipped++
+          if (keep) {
+            audio[(pos + i) * 2] = l
+            audio[(pos + i) * 2 + 1] = r
+          }
+        }
+        o.onBlock?.(block, n)
+      }
+    } finally {
+      this.masterBus.masterGain = savedGain
+      this.masterBus.skipMasterChain = false
+      this.masterBus.skipFinalClamp = false
+    }
+    return { audio, frames, peak: pk, clippedFrames: clipped, renderMs: performance.now() - t0 }
+  }
+
+  /**
+   * The master exactly as it plays (strips, inserts, groups, master chain and fader), rendered offline and
+   * streamed through `onBlock` — for measuring (average spectrum), not for keeping.
+   */
+  renderMaster(o: {
+    startFrame: number
+    frames: number | null
+    onBlock: (block: Float32Array, frames: number) => void
+  }): Promise<{ frames: number; peak: number[]; clippedFrames: number; renderMs: number }> {
+    return this.renderOffline(this.ready(), {
+      startFrame: o.startFrame,
+      frames: o.frames,
+      tailSeconds: 0,
+      masterChain: true,
+      groups: this.getGroups(),
+      keepAudio: false,
+      onBlock: o.onBlock
+    })
+  }
+
   async bounce(
     startFrame: number,
     seconds: number | null,
@@ -390,7 +533,7 @@ export class PlaybackScheduler {
     const kept: Float32Array[] = []
     const t0 = performance.now()
     for (let pos = 0; pos < frames; pos += BLOCK_FRAMES) {
-      const block = await this.masterBus.renderBlock(src, from + pos, BLOCK_FRAMES, sr)
+      const block = await this.masterBus.renderBlock(src, from + pos, BLOCK_FRAMES, sr, this.getGroups())
       const n = Math.min(BLOCK_FRAMES, frames - pos)
       this.meterBlock(n === BLOCK_FRAMES ? block : block.subarray(0, n * 2))
       for (let i = 0; i < n; i++) {
@@ -483,7 +626,8 @@ export class PlaybackScheduler {
     targets: RecTarget[],
     opts: { synthetic?: boolean } = {}
   ): Promise<boolean> {
-    if (state.playing || targets.length === 0) return false
+    // targets may be empty only for a synthetic (MIDI-only) take: it just keeps the transport running
+    if (state.playing || (targets.length === 0 && !opts.synthetic)) return false
     // Clear a lingering tail first — finish() would otherwise end the recording we're about to create.
     if (this.tailing || this.timer !== null) await this.finish()
     const inputChannels = opts.synthetic ? 0 : Math.max(...targets.map((t) => t.ch + (t.stereo ? 2 : 1)))
@@ -515,6 +659,8 @@ export class PlaybackScheduler {
     this.tailing = false
     this.finishing = false
     this.masterBlockPeak = 0
+    this.laneBlockPeaks = new Float32Array(0)
+    this.groupBlockPeaks = new Float32Array(0)
     this.resetLufs()
     this.masterBus.resetInserts() // clear master reverb tails etc. from a previous run
     this.masterBus.resetStrips() // clear every track's channel-strip DSP state (batched in MasterBus now)
@@ -525,14 +671,18 @@ export class PlaybackScheduler {
     // fill the initial look-ahead, then let the device start pulling. This
     // keeps startup underrun-free.
     // blockFrames 0 → ASIO uses its own buffer size; WASAPI falls back to 512.
+    this.monitoring = false // audioStart reopens the device; a monitor-only stream is replaced
+    const liveCh = this.liveBus?.requiredChannels() ?? 0
     const st0 = await window.daw.audioStart({
       sampleRate: state.sampleRate,
       blockFrames: 0,
-      inputChannels: rec?.inputChannels ?? 0,
-      inputSynthetic: rec?.synthetic ?? false
+      inputChannels: Math.max(rec?.inputChannels ?? 0, liveCh),
+      inputSynthetic: rec?.synthetic ? true : this.liveSynthetic
     })
     this.inputChannels = st0.inputChannels
     this.inputError = st0.inputError
+    this.recLatencyFrames = st0.streamLatencyFrames
+    await this.armLive()
     update({ playing: true })
 
     this.st = { at: performance.now(), playedFrames: 0, bufferedFrames: 0, sentFrames: 0, underrunFrames: 0 }
@@ -584,6 +734,15 @@ export class PlaybackScheduler {
     await window.daw.recFlush() // main → renderer chunks are ordered ahead of this reply
     this.rec = null // transport length reverts to the real clip extent
     const takes = await rec.finish()
+    // Time alignment: what the performer heard in sync reached the input one device round trip
+    // later (input + output latency, plus any user offset), so the take moves earlier by that much.
+    // Frames that would land before the timeline origin become the clip's head trim.
+    const shift = Math.max(0, Math.round(this.recLatencyFrames + (this.recOffsetMs * state.sampleRate) / 1000))
+    for (const t of takes) {
+      const want = rec.startFrame - shift
+      t.startFrame = Math.max(0, want)
+      t.skip = Math.max(0, -want)
+    }
     if (takes.length) this.onTakes?.(takes, rec.startFrame)
   }
 
@@ -598,19 +757,83 @@ export class PlaybackScheduler {
     this.started = false
     if (this.rec) await this.endRecording()
     await window.daw.audioStop()
+    if (this.monitorWanted) await this.openMonitorStream() // keep monitoring after the transport stops
+  }
+
+  // ---- live (line-input) monitoring --------------------------------------------------
+
+  /** Reset the live bus for a freshly opened stream and tell main to run its live path. */
+  private async armLive(): Promise<void> {
+    const on = (this.liveBus?.requiredChannels() ?? 0) > 0
+    this.liveBus?.reset()
+    this.liveLateSeen = 0 // main's counters restart with the stream
+    if (on) await this.liveBus?.warmup(state.sampleRate) // compile pipelines before the device pulls
+    await window.daw.liveEnable(on)
+  }
+
+  private async openMonitorStream(): Promise<void> {
+    const liveCh = this.liveBus?.requiredChannels() ?? 0
+    if (liveCh === 0 || state.playing) return
+    const st0 = await window.daw.audioStart({
+      sampleRate: state.sampleRate,
+      blockFrames: 0,
+      inputChannels: liveCh,
+      inputSynthetic: this.liveSynthetic
+    })
+    this.inputChannels = st0.inputChannels
+    this.inputError = st0.inputError
+    await this.armLive()
+    await window.daw.audioBegin()
+    this.monitoring = true
+  }
+
+  /**
+   * Keep the device open and run the live lanes through strip + inserts while the transport is
+   * stopped. (Holding the device open keeps an exclusive ASIO driver away from other programs, so
+   * this is an explicit switch, not automatic.) During playback / recording the transport's own
+   * stream already carries the live path.
+   */
+  async startMonitor(): Promise<void> {
+    this.monitorWanted = true
+    if (state.playing || this.tailing || this.timer !== null) return
+    await this.openMonitorStream()
+  }
+
+  async stopMonitor(): Promise<void> {
+    this.monitorWanted = false
+    if (!this.monitoring) return
+    this.monitoring = false
+    await window.daw.liveEnable(false)
+    await window.daw.audioStop()
+  }
+
+  get monitorOn(): boolean {
+    return this.monitorWanted
+  }
+
+  /** Timing / health of the live path, for the UI and MCP. */
+  liveInfo(): { active: boolean; latencyMs: number; main: AudioOutStatus['live'] | null; bus: ReturnType<LiveBus['stats']> | null } {
+    const sr = state.sampleRate
+    return {
+      active: this.monitoring || (state.playing && (this.liveBus?.requiredChannels() ?? 0) > 0),
+      latencyMs: this.liveBus ? this.liveBus.latencyMs || this.liveBus.defaultLatencyMs(sr) : 0,
+      main: this.liveStatus,
+      bus: this.liveBus?.stats() ?? null
+    }
   }
 
   private async renderUpTo(bufferedTargetFrames: number): Promise<void> {
     const total = this.totalFrames()
     const src = this.ready() // track set is stable within a fill burst
     while (this.scheduledFrame < total && this.bufferedNow() < bufferedTargetFrames) {
-      const block = await this.masterBus.renderBlock(src, this.scheduledFrame, BLOCK_FRAMES, state.sampleRate)
+      const block = await this.masterBus.renderBlock(src, this.scheduledFrame, BLOCK_FRAMES, state.sampleRate, this.getGroups())
       let pk = 0
       for (let j = 0; j < block.length; j++) {
         const a = block[j] < 0 ? -block[j] : block[j]
         if (a > pk) pk = a
       }
       this.masterBlockPeak = pk
+      this.captureLanePeaks()
       this.meterBlock(block)
       window.daw.audioChunk(block.buffer as ArrayBuffer)
       this.scheduledFrame += BLOCK_FRAMES
@@ -652,7 +875,7 @@ export class PlaybackScheduler {
           try {
             while (this.quietBlocks < 3 && this.bufferedNow() < target) {
               // master mix past end-of-track = silence; the inserts decay it.
-              const block = await this.masterBus.renderBlock(this.ready(), this.scheduledFrame, BLOCK_FRAMES, sr)
+              const block = await this.masterBus.renderBlock(this.ready(), this.scheduledFrame, BLOCK_FRAMES, sr, this.getGroups())
               this.meterBlock(block)
               window.daw.audioChunk(block.buffer as ArrayBuffer)
               this.scheduledFrame += BLOCK_FRAMES
@@ -664,6 +887,7 @@ export class PlaybackScheduler {
                 if (a > peak) peak = a
               }
               this.masterBlockPeak = peak
+              this.captureLanePeaks()
               this.quietBlocks = peak < TAIL_SILENCE_PEAK ? this.quietBlocks + 1 : 0
             }
           } finally {

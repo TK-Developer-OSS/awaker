@@ -1,18 +1,21 @@
 {
   "name": "awaker",
   "productName": "Awaker DAW over GPU",
-  "version": "0.0.1",
+  "version": "0.1.0-dev.1",
   "description": "GPGPU-oriented DAW. All audio sample and waveform data lives in WebGPU buffers; the CPU only orchestrates.",
   "private": true,
   "license": "Apache-2.0",
   "main": "out/main/index.js",
-  "author": "@TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)",
+  "author": "TK <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)",
   "scripts": {
     "dev": "node scripts/run.mjs dev",
     "dev:mcp": "node scripts/run.mjs dev --mcp",
     "build": "electron-vite build",
+    "package": "node scripts/package.mjs",
     "preview": "node scripts/run.mjs preview",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node scripts/test.mjs",
+    "build:audio": "node scripts/build-audio.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
@@ -22,7 +25,7 @@
     "typescript": "^5.7.2",
     "vite": "^5.4.11"
   },
-  "dependencies": {
+  "optionalDependencies": {
     "audify": "^1.10.1"
   }
 }

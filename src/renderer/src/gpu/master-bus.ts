@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -61,7 +61,19 @@ export interface LaneClip {
   gain: number
 }
 
+/**
+ * A group channel (bus): the tracks routed to it are summed (each through its own strip / inserts / fader / pan),
+ * the sum goes through the group's inserts, then its fader / pan, and is added to the master.
+ */
+export interface MixGroup {
+  mix: TrackMix
+  /** Group insert plugins: after the sum, before the group fader / pan. */
+  inserts?: Insert[]
+}
+
 export interface MixSource {
+  /** Index into the `groups` passed to `renderBlock`: this track's output goes to that group instead of the master. */
+  group?: number
   /** Placed clips on this lane's timeline. Empty = silent lane. */
   clips: LaneClip[]
   mix: TrackMix
@@ -71,7 +83,7 @@ export interface MixSource {
   inserts?: Insert[]
 }
 
-const MASTER_UBO_SIZE = 48 // 5×u32 + 4×f32, padded to 16
+const MASTER_UBO_SIZE = 48 // 5×u32 + 4×f32 + peakSlot, padded to 16
 const CLIP_UBO_SIZE = 64 // 12×u32 + 4×f32 (see CLIPGATHER_WGSL struct P)
 
 /**
@@ -89,6 +101,10 @@ const CLIP_UBO_SIZE = 64 // 12×u32 + 4×f32 (see CLIPGATHER_WGSL struct P)
  */
 export class MasterBus {
   masterGain = 1
+  /** Offline stem / channel export: skip the master insert chain (the master fader is set to unity by the caller). */
+  skipMasterChain = false
+  /** Offline stem export without the master chain: do not hard-clamp the output at full scale (floats keep their headroom). */
+  skipFinalClamp = false
   /** Master insert effects, processed in order after the mix sum. */
   inserts: Insert[] = []
 
@@ -102,6 +118,11 @@ export class MasterBus {
   private stripFailLogged = false
   private inter: GPUBuffer | null = null // interleaved [L0,R0,...]
   private staging: GPUBuffer | null = null // MAP_READ target, reused every block
+  private peaksBuf: GPUBuffer | null = null // per-track post-fader peaks (u32 bit patterns of f32), cleared every block
+  private peaksStaging: GPUBuffer | null = null
+  private peaksCap = 0
+  /** Post-fader peak (linear) of each source of the last rendered block, in the order of `sources`. */
+  trackPeaks: Float32Array = new Float32Array(0)
   private interBind: GPUBindGroup | null = null // stable while blockFrames holds
   private out = new Float32Array(0) // readback destination, reused every block
   /** One uniform buffer per track slot (reused across blocks; grown on demand). */
@@ -112,7 +133,11 @@ export class MasterBus {
   private gatherLayout: GPUBindGroupLayout | null = null
   private mixAddLayout: GPUBindGroupLayout | null = null
   /** Cached mix-add bind groups by slot (scratch + planar are block-stable). */
-  private mixAddBinds: GPUBindGroup[] = []
+  private mixAddBinds = new Map<string, GPUBindGroup>() // keyed by source / group + where it writes
+  private groupBuf: GPUBuffer | null = null // one [L|R] slice per group: the sum of its tracks
+  private groupBytes = 0
+  /** Post-fader peak (linear) of each group of the last rendered block, in the order of `groups`. */
+  groupPeaks: Float32Array = new Float32Array(0)
   /** Scratch for one clip-gather uniform (rewritten per clip). */
   private cuScratch = new ArrayBuffer(CLIP_UBO_SIZE)
   private cuU32 = new Uint32Array(this.cuScratch)
@@ -158,7 +183,7 @@ export class MasterBus {
     this.blockFrames = blockFrames
     this.wgCount = Math.ceil(blockFrames / 256)
     this.out = new Float32Array(blockFrames * 2)
-    this.mixAddBinds = [] // reference the old scratch / planar buffers
+    this.mixAddBinds.clear() // reference the old scratch / planar buffers
     device.queue.writeBuffer(this.interUbo, 0, new Uint32Array([blockFrames]))
     this.planar = device.createBuffer({
       label: 'master.planar',
@@ -221,6 +246,41 @@ export class MasterBus {
     }
   }
 
+  /** The per-track peak slots (and their readback buffer); the mix-add bind groups reference them. */
+  private ensurePeaks(n: number): void {
+    if (this.peaksBuf && this.peaksCap >= n) return
+    const { device } = getGpu()
+    this.peaksBuf?.destroy()
+    this.peaksStaging?.destroy()
+    this.peaksCap = Math.max(32, n)
+    this.peaksBuf = device.createBuffer({
+      label: 'master.trackPeaks',
+      size: this.peaksCap * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    })
+    this.peaksStaging = device.createBuffer({
+      label: 'master.trackPeaksStaging',
+      size: this.peaksCap * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+    })
+    this.mixAddBinds.clear() // they reference the old peaks buffer
+  }
+
+  private ensureGroupBuf(nGroups: number, blockFrames: number): GPUBuffer {
+    const need = nGroups * blockFrames * 2 * 4
+    if (this.groupBuf && this.groupBytes >= need) return this.groupBuf
+    const { device } = getGpu()
+    this.groupBuf?.destroy()
+    this.groupBytes = Math.max(need, 4 * blockFrames * 2 * 4)
+    this.groupBuf = device.createBuffer({
+      label: 'master.groups',
+      size: this.groupBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    })
+    this.mixAddBinds.clear()
+    return this.groupBuf
+  }
+
   private ensureTrackUbos(n: number): void {
     const { device } = getGpu()
     while (this.trackUbos.length < n) {
@@ -242,7 +302,8 @@ export class MasterBus {
     sources: MixSource[],
     startFrame: number,
     blockFrames: number,
-    sampleRate: number
+    sampleRate: number,
+    groups: MixGroup[] = []
   ): Promise<Float32Array> {
     const { device } = getGpu()
     this.ensureBlock(blockFrames)
@@ -253,7 +314,10 @@ export class MasterBus {
       return this.out
     }
 
-    this.ensureTrackUbos(sources.length)
+    const nSrc = sources.length
+    const nGrp = groups.length
+    this.ensureTrackUbos(nSrc + nGrp)
+    this.ensurePeaks(nSrc + nGrp)
     let totalClips = 0
     for (const s of sources) totalClips += s.clips.length
     this.ensureClipUbos(totalClips)
@@ -265,6 +329,8 @@ export class MasterBus {
     const planar = this.planar!
     const big = this.ensureBig(sources.length, blockFrames)
     const regionBytes = blockFrames * 2 * 4
+    const groupBuf = nGrp > 0 ? this.ensureGroupBuf(nGrp, blockFrames) : null
+    const mixAddLayout = this.mixAddLayout!
     const enc = device.createCommandEncoder()
     const u32 = this.ubU32
     const f32 = this.ubF32
@@ -336,58 +402,86 @@ export class MasterBus {
       }
     }
 
-    // 3. per track: copy its strip output slice into the shared scratch, run the
-    //    insert plugins, then mix-add into the planar master. The copy lets the
-    //    insert / mix-add passes keep assuming a `[L|R]`-at-0 buffer.
-    for (let i = 0; i < sources.length; i++) {
-      const { mix, inserts } = sources[i]
+    enc.clearBuffer(this.peaksBuf!, 0, (nSrc + nGrp) * 4) // the mix-add passes take the max into these
+    // every mix-add accumulates, so the master sum (and the group sums) start from silence each block
+    enc.clearBuffer(planar)
+    if (groupBuf) enc.clearBuffer(groupBuf, 0, nGrp * regionBytes)
+    const fed = new Set<number>() // groups that at least one track is routed to
 
-      // Per-lane MIXADD uniform: constant-power pan (center → panL=panR=1),
-      // fader gain, master gain. track 0 writes the planar sum, the rest add.
+    // One mix-add pass: scratch -> `to` (the master planar sum or a group slice), with fader / pan / master gain.
+    const mixAddInto = (idx: number, mix: TrackMix, toGroup: number | null, label: string): void => {
       const theta = ((mix.pan + 1) * Math.PI) / 4
       u32[0] = blockFrames
-      u32[4] = i === 0 ? 0 : 1 // accumulate
+      u32[4] = 1 // accumulate
+      u32[9] = idx // peak slot
       f32[5] = mix.gain
-      f32[6] = Math.cos(theta) * Math.SQRT2 // panL
+      f32[6] = Math.cos(theta) * Math.SQRT2 // panL (centre: constant-power, = 1)
       f32[7] = Math.sin(theta) * Math.SQRT2 // panR
-      f32[8] = this.masterGain
-      device.queue.writeBuffer(this.trackUbos[i], 0, this.ubScratch)
-
-      enc.copyBufferToBuffer(big, i * regionBytes, scratch, 0, regionBytes)
-
-      const io = { sig: scratch, blockFrames, baseIndex: this.processed, sampleRate }
-      if (inserts) {
-        for (const fx of inserts) {
-          if (!fx.bypass) fx.process(enc, io)
-        }
-      }
-
-      let m = this.mixAddBinds[i]
+      f32[8] = toGroup === null ? this.masterGain : 1 // the master fader acts once, on the way into the master
+      device.queue.writeBuffer(this.trackUbos[idx], 0, this.ubScratch)
+      const key = `${idx}:${toGroup === null ? 'm' : toGroup}`
+      let m = this.mixAddBinds.get(key)
       if (!m) {
         m = device.createBindGroup({
-          layout: this.mixAddLayout,
+          layout: mixAddLayout,
           entries: [
-            { binding: 0, resource: { buffer: this.trackUbos[i] } },
+            { binding: 0, resource: { buffer: this.trackUbos[idx] } },
             { binding: 1, resource: { buffer: scratch } },
-            { binding: 2, resource: { buffer: planar } }
+            {
+              binding: 2,
+              resource:
+                toGroup === null
+                  ? { buffer: planar }
+                  : { buffer: groupBuf!, offset: toGroup * regionBytes, size: regionBytes }
+            },
+            { binding: 3, resource: { buffer: this.peaksBuf! } }
           ]
         })
-        this.mixAddBinds[i] = m
+        this.mixAddBinds.set(key, m)
       }
-      const mp = enc.beginComputePass({ label: `mix-add.track${i}` })
+      const mp = enc.beginComputePass({ label })
       mp.setPipeline(mixAdd)
       mp.setBindGroup(0, m)
       mp.dispatchWorkgroups(this.wgCount)
       mp.end()
     }
 
+    // 3. per track: copy its strip output slice into the shared scratch, run the insert plugins, then
+    //    mix-add into the master sum — or into its group's sum. The copy lets the insert / mix-add passes
+    //    keep assuming a `[L|R]`-at-0 buffer.
+    for (let i = 0; i < nSrc; i++) {
+      const { mix, inserts, group } = sources[i]
+      enc.copyBufferToBuffer(big, i * regionBytes, scratch, 0, regionBytes)
+      const io = { sig: scratch, blockFrames, baseIndex: this.processed, sampleRate }
+      if (inserts) {
+        for (const fx of inserts) {
+          if (!fx.bypass) fx.process(enc, io)
+        }
+      }
+      const toGroup = groupBuf && group !== undefined && group >= 0 && group < nGrp ? group : null
+      if (toGroup !== null) fed.add(toGroup)
+      mixAddInto(i, mix, toGroup, `mix-add.track${i}`)
+    }
+
+    // 3b. group channels: the sum of its tracks -> group inserts -> group fader / pan -> master sum
+    for (let g = 0; g < nGrp; g++) {
+      if (!fed.has(g)) continue
+      enc.copyBufferToBuffer(groupBuf!, g * regionBytes, scratch, 0, regionBytes)
+      const io = { sig: scratch, blockFrames, baseIndex: this.processed, sampleRate }
+      for (const fx of groups[g].inserts ?? []) {
+        if (!fx.bypass) fx.process(enc, io)
+      }
+      mixAddInto(nSrc + g, groups[g].mix, null, `mix-add.group${g}`)
+    }
+
     // 4. master insert chain (in place on the planar sum)
     for (const fx of this.inserts) {
-      if (fx.bypass) continue
+      if (fx.bypass || this.skipMasterChain) continue
       fx.process(enc, { sig: planar, blockFrames, baseIndex: this.processed, sampleRate })
     }
 
     // 5. interleave → readback (bind group is stable while blockFrames holds)
+    device.queue.writeBuffer(this.interUbo, 0, new Uint32Array([blockFrames, this.skipFinalClamp ? 0 : 1]))
     {
       const pass = enc.beginComputePass({ label: 'interleave' })
       pass.setPipeline(interleave)
@@ -397,12 +491,19 @@ export class MasterBus {
     }
 
     enc.copyBufferToBuffer(this.inter!, 0, this.staging!, 0, blockFrames * 2 * 4)
+    enc.copyBufferToBuffer(this.peaksBuf!, 0, this.peaksStaging!, 0, (nSrc + nGrp) * 4)
     device.queue.submit([enc.finish()])
     this.processed += blockFrames
 
-    await this.staging!.mapAsync(GPUMapMode.READ)
+    await Promise.all([this.staging!.mapAsync(GPUMapMode.READ), this.peaksStaging!.mapAsync(GPUMapMode.READ)])
     this.out.set(new Float32Array(this.staging!.getMappedRange()))
     this.staging!.unmap()
+    const pk = new Float32Array(this.peaksStaging!.getMappedRange(0, (nSrc + nGrp) * 4).slice(0))
+    this.peaksStaging!.unmap()
+    // a NaN would sort above every number in the atomic max: show it as a (red) overload, not as silence
+    for (let i = 0; i < pk.length; i++) if (!Number.isFinite(pk[i])) pk[i] = 1e6
+    this.trackPeaks = pk.subarray(0, nSrc)
+    this.groupPeaks = pk.subarray(nSrc)
     return this.out
   }
 }

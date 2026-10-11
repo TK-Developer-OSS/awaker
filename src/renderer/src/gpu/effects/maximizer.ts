@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -30,7 +30,11 @@ export class MaximizerInsert implements Insert {
   bypass = false
   params: MaximizerParams = { gainDb: 0, ceilingDb: -1, releaseMs: 200 }
 
-  private pipeline: GPUComputePipeline | null = null
+  private bgl: GPUBindGroupLayout | null = null
+  private pipes: Record<'prep' | 'envs' | 'apply' | 'save', GPUComputePipeline> | null = null
+  private scratchX: GPUBuffer | null = null
+  private scratchG: GPUBuffer | null = null
+  private scratchFrames = 0
   private sr = 0
   private lineLen = 0
   private lookahead = 0
@@ -66,16 +70,33 @@ export class MaximizerInsert implements Insert {
     this.reset()
   }
 
-  private getPipeline(): GPUComputePipeline {
-    if (!this.pipeline) {
+  private getPipes(): NonNullable<MaximizerInsert['pipes']> {
+    if (!this.pipes) {
       const { device } = getGpu()
-      this.pipeline = device.createComputePipeline({
-        label: 'maximizer',
-        layout: 'auto',
-        compute: { module: device.createShaderModule({ code: MAXIMIZER_WGSL }), entryPoint: 'main' }
+      const module = device.createShaderModule({ code: MAXIMIZER_WGSL })
+      const stor: GPUBufferBindingLayout = { type: 'storage' }
+      this.bgl = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+          ...[1, 2, 3, 4, 5].map((binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: stor }))
+        ]
       })
+      const layout = device.createPipelineLayout({ bindGroupLayouts: [this.bgl] })
+      const mk = (entryPoint: 'prep' | 'envs' | 'apply' | 'save'): GPUComputePipeline =>
+        device.createComputePipeline({ label: `maximizer.${entryPoint}`, layout, compute: { module, entryPoint } })
+      this.pipes = { prep: mk('prep'), envs: mk('envs'), apply: mk('apply'), save: mk('save') }
     }
-    return this.pipeline
+    return this.pipes
+  }
+
+  private ensureScratch(blockFrames: number): void {
+    if (this.scratchX && this.scratchFrames >= blockFrames) return
+    const { device } = getGpu()
+    this.scratchX?.destroy()
+    this.scratchG?.destroy()
+    this.scratchX = device.createBuffer({ label: 'maximizer.x', size: 2 * blockFrames * 4, usage: GPUBufferUsage.STORAGE })
+    this.scratchG = device.createBuffer({ label: 'maximizer.g', size: blockFrames * 4, usage: GPUBufferUsage.STORAGE })
+    this.scratchFrames = blockFrames
   }
 
   reset(): void {
@@ -110,20 +131,26 @@ export class MaximizerInsert implements Insert {
     this.f32.set([inGain, ceilingLin, atkCoef, relCoef, holdRel, 1 /* outTrim */, 0, 0], 4)
     device.queue.writeBuffer(this.ubo, 0, this.ab)
 
-    const pipe = this.getPipeline()
+    this.ensureScratch(io.blockFrames)
+    const pipes = this.getPipes()
     const bind = device.createBindGroup({
-      layout: pipe.getBindGroupLayout(0),
+      layout: this.bgl!,
       entries: [
         { binding: 0, resource: { buffer: this.ubo } },
         { binding: 1, resource: { buffer: io.sig } },
         { binding: 2, resource: { buffer: this.line! } },
-        { binding: 3, resource: { buffer: this.stt! } }
+        { binding: 3, resource: { buffer: this.stt! } },
+        { binding: 4, resource: { buffer: this.scratchX! } },
+        { binding: 5, resource: { buffer: this.scratchG! } }
       ]
     })
+    const groups = Math.ceil(io.blockFrames / 256)
     const pass = enc.beginComputePass({ label: 'maximizer' })
-    pass.setPipeline(pipe)
-    pass.setBindGroup(0, bind)
-    pass.dispatchWorkgroups(1)
+    for (const [k, n] of [['prep', groups], ['envs', 1], ['apply', groups], ['save', groups]] as const) {
+      pass.setPipeline(pipes[k])
+      pass.setBindGroup(0, bind)
+      pass.dispatchWorkgroups(n)
+    }
     pass.end()
   }
 }

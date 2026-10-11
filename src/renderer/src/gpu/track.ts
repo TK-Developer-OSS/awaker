@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -194,6 +194,15 @@ export class GpuTrack {
       staging.destroy()
     }
     return out
+  }
+
+  /**
+   * Reserve exactly `frames` of (uninitialised) channel buffers for a procedural
+   * render — an instrument writes straight into `channels[]` on the GPU, then calls
+   * `computePeaks()`. Replaces any previous content.
+   */
+  prepare(frames: number, channelCount: 1 | 2 = 2): void {
+    this.allocate(Math.max(1, Math.floor(frames)), channelCount)
   }
 
   /** Generate a calm stereo test chord entirely on the GPU (no disk, no CPU array). */

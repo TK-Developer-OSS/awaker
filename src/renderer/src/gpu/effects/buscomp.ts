@@ -1,13 +1,14 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
 import { getGpu } from '../device'
 import { biquad } from '../biquad'
 import { BUSCOMP_WGSL } from '../shaders'
+import { chunkTransition } from './eq5'
 import type { BlockIO, Insert } from '../insert'
 
-/** SSL-style stepped values — the knobs snap to these. */
+/** SL-style stepped values — the knobs snap to these. */
 export const BUSCOMP_RATIOS = [2, 4, 10]
 export const BUSCOMP_ATTACKS_MS = [0.1, 0.3, 1, 3, 10, 30]
 /** Release positions; -1 = Auto (program-dependent). */
@@ -32,8 +33,8 @@ export interface BusCompParams {
 
 /**
  * Master bus compressor (see BUSCOMP_WGSL). Stereo-linked feed-forward comp with
- * a soft knee, SSL-G-bus voicing, and one knob of bright harmonic colour. Coeffs
- * are derived on the CPU per block; the recurrence runs on one GPU thread.
+ * a soft knee, SL-G-bus voicing, and one knob of bright harmonic colour. Coeffs
+ * are derived on the CPU per block; only the detector envelope is serial on the GPU; the rest runs as parallel scans.
  */
 export class BusCompInsert implements Insert {
   readonly name = 'buscomp'
@@ -48,30 +49,51 @@ export class BusCompInsert implements Insert {
     mix: 1
   }
 
-  private pipeline: GPUComputePipeline | null = null
+  private bgl: GPUBindGroupLayout | null = null
+  private pipes: Record<'envs' | 'prep' | 'scan', GPUComputePipeline> | null = null
+  private scratchE: GPUBuffer | null = null
+  private scratchW: GPUBuffer | null = null
+  private scratchFrames = 0
   private ubo: GPUBuffer
   private state: GPUBuffer
-  private ab = new ArrayBuffer(96)
+  private ab = new ArrayBuffer(128)
   private u32 = new Uint32Array(this.ab)
   private f32 = new Float32Array(this.ab)
 
   constructor() {
     const { device } = getGpu()
-    this.ubo = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+    this.ubo = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
     this.state = device.createBuffer({ size: 16 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
     this.reset()
   }
 
-  private getPipeline(): GPUComputePipeline {
-    if (!this.pipeline) {
+  private getPipes(): NonNullable<BusCompInsert['pipes']> {
+    if (!this.pipes) {
       const { device } = getGpu()
-      this.pipeline = device.createComputePipeline({
-        label: 'buscomp',
-        layout: 'auto',
-        compute: { module: device.createShaderModule({ code: BUSCOMP_WGSL }), entryPoint: 'main' }
+      const module = device.createShaderModule({ code: BUSCOMP_WGSL })
+      const stor: GPUBufferBindingLayout = { type: 'storage' }
+      this.bgl = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+          ...[1, 2, 3, 4].map((binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: stor }))
+        ]
       })
+      const layout = device.createPipelineLayout({ bindGroupLayouts: [this.bgl] })
+      const mk = (entryPoint: 'envs' | 'prep' | 'scan'): GPUComputePipeline =>
+        device.createComputePipeline({ label: `buscomp.${entryPoint}`, layout, compute: { module, entryPoint } })
+      this.pipes = { envs: mk('envs'), prep: mk('prep'), scan: mk('scan') }
     }
-    return this.pipeline
+    return this.pipes
+  }
+
+  private ensureScratch(blockFrames: number): void {
+    if (this.scratchE && this.scratchFrames >= blockFrames) return
+    const { device } = getGpu()
+    this.scratchE?.destroy()
+    this.scratchW?.destroy()
+    this.scratchE = device.createBuffer({ label: 'buscomp.env', size: blockFrames * 4, usage: GPUBufferUsage.STORAGE })
+    this.scratchW = device.createBuffer({ label: 'buscomp.work', size: 2 * blockFrames * 4, usage: GPUBufferUsage.STORAGE })
+    this.scratchFrames = blockFrames
   }
 
   reset(): void {
@@ -117,21 +139,32 @@ export class BusCompInsert implements Insert {
       ],
       2
     )
+    // chunk constants for the parallel scans (see BUSCOMP_WGSL): float64 here, exact in the shader
+    const chunk = Math.ceil(io.blockFrames / 256)
+    this.f32.set(chunkTransition(Math.fround(hs[3]), Math.fround(hs[4]), chunk), 24)
+    this.f32.set([Math.pow(1 - Math.fround(emphA), chunk), Math.pow(1 - Math.fround(0.0016), chunk), 0, 0], 28)
     device.queue.writeBuffer(this.ubo, 0, this.ab)
 
-    const pipe = this.getPipeline()
+    this.ensureScratch(io.blockFrames)
+    const pipes = this.getPipes()
     const bind = device.createBindGroup({
-      layout: pipe.getBindGroupLayout(0),
+      layout: this.bgl!,
       entries: [
         { binding: 0, resource: { buffer: this.ubo } },
         { binding: 1, resource: { buffer: io.sig } },
-        { binding: 2, resource: { buffer: this.state } }
+        { binding: 2, resource: { buffer: this.state } },
+        { binding: 3, resource: { buffer: this.scratchE! } },
+        { binding: 4, resource: { buffer: this.scratchW! } }
       ]
     })
     const pass = enc.beginComputePass({ label: 'buscomp' })
-    pass.setPipeline(pipe)
     pass.setBindGroup(0, bind)
+    pass.setPipeline(pipes.envs)
     pass.dispatchWorkgroups(1)
+    pass.setPipeline(pipes.prep)
+    pass.dispatchWorkgroups(Math.ceil(io.blockFrames / 256))
+    pass.setPipeline(pipes.scan)
+    pass.dispatchWorkgroups(2) // one 256-thread workgroup per channel
     pass.end()
   }
 }

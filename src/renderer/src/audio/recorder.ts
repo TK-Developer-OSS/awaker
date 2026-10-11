@@ -1,4 +1,4 @@
-// Copyright 2026 @TK_Developer <tk.oss.developer@gmail.com> (https://x.com/TK_Developer)
+// Copyright 2026 TK <tk.oss.developer@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 // Generated with Claude Code (https://claude.com/claude-code)
 
@@ -27,6 +27,8 @@ export interface Take {
   laneId: number
   startFrame: number
   frames: number
+  /** Head frames that fall before the timeline start after latency compensation (clip srcOffset). */
+  skip?: number
   gpu: GpuTrack
   /** Planar read-back (for the WAV file + meter envelope). */
   planar: Float32Array[]

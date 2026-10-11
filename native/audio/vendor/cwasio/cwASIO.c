@@ -1,0 +1,364 @@
+/** @file       cwASIO.c
+ *  @brief      cwASIO native API
+ *  @author     Stefan Heinzmann
+ *  @version    1.0
+ *  @date       2023-2024
+ *  @copyright  See file LICENSE in toplevel directory
+ * @addtogroup cwASIO
+ *  @{
+ */
+
+#include "cwASIO.h"
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#   define NOMINMAX
+#   define WIN32_LEAN_AND_MEAN 
+#   include <Windows.h>
+#   include <combaseapi.h>
+#   include <guiddef.h>
+#   include <unknwnbase.h>
+#else
+#   include <alloca.h>
+#   include <dirent.h>
+#   include <dlfcn.h>
+#   include <errno.h>
+#   include <fcntl.h>
+#   include <unistd.h>
+#   include <sys/stat.h>
+#endif
+
+// copy a UTF-8 string of the given length into a buffer of the given size, truncating it at a
+// character boundary if it doesn't fit, and terminate it with a NUL
+static void copyTruncated(char *buffer, unsigned size, char const *str, size_t len) {
+    if (len >= size) {
+        len = size - 1;
+        while (len > 0 && (str[len] & 0xC0) == 0x80)
+            --len;      // don't split a multibyte sequence
+    }
+    memcpy(buffer, str, len);
+    buffer[len] = '\0';
+}
+
+#ifdef _WIN32
+
+static char *toUTF8(wchar_t const *wstr) {
+    if (wstr) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+        if (len > 0) {
+            char *buf = malloc(len);
+            len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, buf, len, NULL, NULL);
+            if (len > 0)
+                return buf;
+            free(buf);
+        }
+    }
+    return NULL;
+};
+
+static wchar_t *fromUTF8(char const *str) {
+    if (str) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
+        if (len > 0) {
+            wchar_t *buf = malloc(len * sizeof(wchar_t));
+            len = MultiByteToWideChar(CP_UTF8, 0, str, -1, buf, len);
+            if (len > 0)
+                return buf;
+            free(buf);
+        }
+    }
+    return NULL;
+};
+
+#ifdef _MSC_VER
+#   define CWASIO_THREAD_LOCAL __declspec(thread)
+#else
+#   define CWASIO_THREAD_LOCAL _Thread_local
+#endif
+
+// Number of successful CoInitializeEx() calls made by cwASIOload() on this thread that
+// still need to be balanced by CoUninitialize() in cwASIOunload().
+static CWASIO_THREAD_LOCAL unsigned comInitCount = 0;
+
+long cwASIOload(char const *key, struct cwASIODriver **drv) {
+    CLSID id;
+    HRESULT res = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    // RPC_E_CHANGED_MODE means COM is already initialized as MTA on this thread, which is usable
+    // as well, but must not be balanced by CoUninitialize()
+    bool comInitialized = SUCCEEDED(res);
+    if (FAILED(res) && res != RPC_E_CHANGED_MODE)
+        return res;
+    if (cwASIOtoGUID(key, &id)) {
+        // ASIO (ab)uses the CLSID for the IID, so we use the same ID twice here
+        res = CoCreateInstance(&id, NULL, CLSCTX_INPROC_SERVER, &id, (void**)drv);
+    } else {
+        res = E_INVALIDARG;
+    }
+    if (FAILED(res)) {
+        if (comInitialized)
+            CoUninitialize();
+        return res;
+    }
+    if (comInitialized)
+        ++comInitCount;
+    return 0;
+}
+
+void cwASIOunload(struct cwASIODriver *drv) {
+    if(drv)
+        drv->lpVtbl->release(drv);
+    if (comInitCount > 0) {
+        --comInitCount;
+        CoUninitialize();
+    }
+}
+
+static LSTATUS getValue(HKEY hkey, wchar_t *subKey, wchar_t *name, wchar_t **val, DWORD *len) {
+    LSTATUS err = ERROR_SUCCESS;
+    for (;;) {    // try until buffer size is sufficient
+        err = RegGetValueW(hkey, subKey, name, RRF_RT_REG_SZ, NULL, *val, len);
+        if (err != ERROR_MORE_DATA)
+            break;
+        wchar_t *tmp = *val;
+        *val = realloc(tmp, *len * sizeof(wchar_t));
+        if (!*val)
+            free(tmp);
+    }
+    if (*val && err != ERROR_SUCCESS)
+        (*val)[0] = '\0';
+    return err;
+}
+
+int cwASIOenumerate(cwASIOcallback *cb, void *context) {
+    HKEY hkey;
+    LSTATUS err = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO", 0, KEY_READ, &hkey);
+    if (err != ERROR_SUCCESS)
+        return err;
+
+    DWORD subkeyLen;
+    err = RegQueryInfoKeyW(hkey, NULL, NULL, NULL, NULL, &subkeyLen, NULL, NULL, NULL, NULL, NULL, NULL);
+    if (err != ERROR_SUCCESS)
+        goto close_hkey;
+
+    wchar_t *subKey = malloc(sizeof(wchar_t) * (subkeyLen + 1));
+    DWORD clsidLen = 40;
+    wchar_t *clsid = malloc(sizeof(wchar_t) * clsidLen);
+    DWORD descriptionLen = 16;
+    wchar_t *description = malloc(sizeof(wchar_t) * descriptionLen);
+    for (DWORD index = 0; err != ERROR_NO_MORE_ITEMS; ++index) {
+        if (!subKey || !clsid || !description)
+            break;
+
+        DWORD nameLen = subkeyLen + 1;      // account for terminating NUL
+        err = RegEnumKeyExW(hkey, index, subKey, &nameLen, NULL, NULL, NULL, NULL);
+        if (err != ERROR_SUCCESS)
+            continue;
+
+        err = getValue(hkey, subKey, L"CLSID", &clsid, &clsidLen);
+        err = getValue(hkey, subKey, L"Description", &description, &descriptionLen);
+
+        char *nm = toUTF8(subKey);
+        char *id = toUTF8(clsid);
+        char *de = toUTF8(description);
+        if (cb(context, nm, id, de))
+            err = ERROR_SUCCESS;            // continue iteration if enumerate returns true
+        else
+            err = ERROR_NO_MORE_ITEMS;      // terminate iteration if enumerate returns false
+        free(de);
+        free(id);
+        free(nm);
+    }
+    err = ERROR_SUCCESS;
+    free(description);
+    free(clsid);
+    free(subKey);
+close_hkey:
+    RegCloseKey(hkey);
+    return err;
+}
+
+int cwASIOgetParameter(char const *name, char const *key, char *buffer, unsigned size) {
+    enum {subkeysize = 256, buffersize=2048};
+    if(!name)
+        return ASE_InvalidParameter;
+    wchar_t subkey[subkeysize] = L"SOFTWARE\\ASIO\\";
+    int n = wcslen(subkey);     // remember length so far for appending
+    n = MultiByteToWideChar(CP_UTF8, 0, name, -1, subkey + n, subkeysize - n);      // append name
+    if(n <= 0)
+        return ASE_InvalidParameter;
+    wchar_t *value = fromUTF8(key);
+    if(!value) {    // we just check if the subkey exists
+        HKEY hk;
+        LSTATUS stat = RegOpenKeyW(HKEY_LOCAL_MACHINE, subkey, &hk);
+        if(stat != ERROR_SUCCESS)
+            return ASE_NotPresent;
+        RegCloseKey(hk);
+        return ASE_OK;
+    }
+    wchar_t buf[buffersize];
+    DWORD bufsize = sizeof(buf);    // in bytes
+    LSTATUS err = RegGetValueW(HKEY_LOCAL_MACHINE, subkey, value, RRF_RT_REG_SZ, NULL, buf, &bufsize);
+    free(value);
+    if (err)
+        return ASE_NotPresent;
+    if (!buffer || size == 0)
+        return 0;
+    char *val = toUTF8(buf);        // RegGetValueW guarantees NUL termination
+    if (!val)
+        return ASE_NotPresent;
+    size_t len = strlen(val);
+    copyTruncated(buffer, size, val, len);
+    free(val);
+    return (int)len + 1;
+}
+
+#else
+
+typedef struct cwASIODriver * (CWASIO_METHOD InstantiateDriver)(void);
+
+long cwASIOload(char const *id, struct cwASIODriver **drv) {
+    void *lib = dlopen(id, RTLD_LOCAL | RTLD_NOW);
+    if(!lib)
+        return ASE_NotPresent;
+
+    InstantiateDriver *instantiateDriver = dlsym(lib, "instantiateDriver");
+    if (!instantiateDriver)
+        return ASE_NotPresent;
+
+    *drv = instantiateDriver();
+
+    return *drv ? ASE_OK : ASE_NotPresent;
+}
+
+void cwASIOunload(struct cwASIODriver *drv) {
+    if(drv)
+        drv->lpVtbl->release(drv);
+}
+
+static char *cwASIOreadConfig(char const *base, char const *name, char const *file) {
+    size_t baseLen = strlen(base);
+    size_t nameLen = strlen(name);
+    char *path = (char *)alloca(baseLen + 1 + nameLen + 1 + strlen(file) + 1);
+    strcpy(path, base);
+    path[baseLen] = '/';
+    strcpy(path + baseLen + 1, name);
+    path[baseLen + 1 + nameLen] = '/';
+    strcpy(path + baseLen + 1 + nameLen + 1, file);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return NULL;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return NULL;
+    }
+
+    size_t size = st.st_size;
+    if (size > 1023)
+        size = 1023;  // limit buffer size
+    char *txt = (char *)malloc(size + 1);
+    ssize_t len = read(fd, txt, size);
+    int err = errno;
+    close(fd);
+    if (len < 0) {
+        free(txt);
+        errno = err;
+        return NULL;
+    }
+    else {
+        txt[len] = '\0';
+        char *end = strchr(txt, '\n');
+        if (end)
+            *end = '\0';    // terminate at end of first line
+        errno = err;
+        return txt;
+    }
+}
+
+int cwASIOgetParameter(char const *name, char const *key, char *buffer, unsigned size) {
+    if (!key) {
+        char path[2048];
+        snprintf(path, sizeof(path), "/etc/cwASIO/%s", name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+            return 0;
+        else
+            return -ENOENT;
+    }
+
+    char *val = cwASIOreadConfig("/etc/cwASIO", name, key);
+    if (!val)
+        return -errno;
+    int ret = 0;
+    if (buffer && size > 0) {
+        size_t len = strlen(val);
+        copyTruncated(buffer, size, val, len);
+        ret = (int)len + 1;
+    }
+    free(val);
+    return ret;
+}
+
+int cwASIOenumerate(cwASIOcallback *cb, void *context) {
+    static char const *path = "/etc/cwASIO";
+    int res = 0;
+    struct dirent *rent;
+    DIR *base = opendir(path);
+
+    if (!base)
+        return errno;
+
+    do {
+        errno = 0;
+        rent = readdir(base);
+        if (!rent) {
+            res = errno;
+            break;
+        }
+        else if (rent->d_name[0] == '.') {
+            continue;   // ignore entries starting with a dot
+        }
+        else {
+            char *driver = cwASIOreadConfig(path, rent->d_name, "driver");
+            char *description = cwASIOreadConfig(path, rent->d_name, "description");
+            if (!cb(context, rent->d_name, driver, description))
+                rent = NULL;
+            free(driver);
+            free(description);
+        }
+    } while (rent);
+
+    closedir(base);
+    return res;
+}
+
+#endif
+
+bool cwASIOcompareGUID(cwASIOGUID const *a, cwASIOGUID const *b) {
+    return a && b ? 0 == memcmp(a, b, sizeof(cwASIOGUID)) : a == b;
+}
+
+bool cwASIOtoGUID(char const *clsid, cwASIOGUID *guid) {
+    if (!clsid || !guid)
+        return false;
+    cwASIOGUID tmp;
+    uint32_t data1;     // Introduced to avoid a type mismatch on Windows, where data1 is unsigned long
+    int n = sscanf(clsid, "{%8" SCNx32 "-%4" SCNx16 "-%4" SCNx16 "-%2" SCNx8 "%2" SCNx8 "-%2" SCNx8 "%2" SCNx8 "%2" SCNx8 "%2" SCNx8 "%2" SCNx8 "%2" SCNx8 "}"
+        , &data1, &tmp.Data2, &tmp.Data3
+        , &tmp.Data4[0], &tmp.Data4[1], &tmp.Data4[2], &tmp.Data4[3]
+        , &tmp.Data4[4], &tmp.Data4[5], &tmp.Data4[6], &tmp.Data4[7]);
+    if (n != 11)
+        return false;
+    tmp.Data1 = data1;
+    *guid = tmp;
+    return true;
+}
+
+/** @}*/

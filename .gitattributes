@@ -1,0 +1,12 @@
+# Line endings: CRLF in the working tree (stored as LF in the repository).
+* text=auto eol=crlf
+
+# never touch binaries or hashed fixtures
+*.png binary
+*.ico binary
+*.svg text
+*.wav binary
+*.zip binary
+*.node binary
+*.bin binary
+tests/golden/** -text

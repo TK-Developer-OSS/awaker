@@ -1,0 +1,437 @@
+{
+  "tolerance": 0.05,
+  "presets": {
+    "Punch Bass": {
+      "vel110": {
+        "peakDb": [
+          -5.022,
+          -5.022
+        ],
+        "rmsDb": [
+          -18.298,
+          -18.298
+        ],
+        "lufsIntegrated": -11.703
+      },
+      "vel40": {
+        "peakDb": [
+          -10.907,
+          -10.907
+        ],
+        "rmsDb": [
+          -23.175,
+          -23.175
+        ],
+        "lufsIntegrated": -16.737
+      }
+    },
+    "Pluck Bass": {
+      "vel110": {
+        "peakDb": [
+          -6.514,
+          -6.514
+        ],
+        "rmsDb": [
+          -29.787,
+          -29.787
+        ],
+        "lufsIntegrated": -19.125
+      },
+      "vel40": {
+        "peakDb": [
+          -12.965,
+          -12.965
+        ],
+        "rmsDb": [
+          -34.623,
+          -34.623
+        ],
+        "lufsIntegrated": -24.566
+      }
+    },
+    "Rubber Bass": {
+      "vel110": {
+        "peakDb": [
+          -7.841,
+          -7.841
+        ],
+        "rmsDb": [
+          -21.577,
+          -21.577
+        ],
+        "lufsIntegrated": -13.297
+      },
+      "vel40": {
+        "peakDb": [
+          -12.987,
+          -12.987
+        ],
+        "rmsDb": [
+          -26.882,
+          -26.882
+        ],
+        "lufsIntegrated": -19.118
+      }
+    },
+    "Hollow Bass": {
+      "vel110": {
+        "peakDb": [
+          -7.518,
+          -7.518
+        ],
+        "rmsDb": [
+          -18.118,
+          -18.118
+        ],
+        "lufsIntegrated": -10.309
+      },
+      "vel40": {
+        "peakDb": [
+          -12.725,
+          -12.725
+        ],
+        "rmsDb": [
+          -22.313,
+          -22.313
+        ],
+        "lufsIntegrated": -14.944
+      }
+    },
+    "Electric Piano": {
+      "vel110": {
+        "peakDb": [
+          -6.426,
+          -6.426
+        ],
+        "rmsDb": [
+          -21.288,
+          -21.288
+        ],
+        "lufsIntegrated": -12.229
+      },
+      "vel40": {
+        "peakDb": [
+          -12.339,
+          -12.339
+        ],
+        "rmsDb": [
+          -26.315,
+          -26.315
+        ],
+        "lufsIntegrated": -17.713
+      }
+    },
+    "FM Keys": {
+      "vel110": {
+        "peakDb": [
+          -5.953,
+          -5.953
+        ],
+        "rmsDb": [
+          -20.934,
+          -20.934
+        ],
+        "lufsIntegrated": -13.38
+      },
+      "vel40": {
+        "peakDb": [
+          -11.45,
+          -11.45
+        ],
+        "rmsDb": [
+          -26.621,
+          -26.621
+        ],
+        "lufsIntegrated": -19.371
+      }
+    },
+    "Glass Pluck": {
+      "vel110": {
+        "peakDb": [
+          -6.458,
+          -6.458
+        ],
+        "rmsDb": [
+          -25.468,
+          -25.468
+        ],
+        "lufsIntegrated": -15.945
+      },
+      "vel40": {
+        "peakDb": [
+          -12.303,
+          -12.303
+        ],
+        "rmsDb": [
+          -30.843,
+          -30.843
+        ],
+        "lufsIntegrated": -21.858
+      }
+    },
+    "Marimba": {
+      "vel110": {
+        "peakDb": [
+          -5.466,
+          -5.466
+        ],
+        "rmsDb": [
+          -26.474,
+          -26.474
+        ],
+        "lufsIntegrated": -18.007
+      },
+      "vel40": {
+        "peakDb": [
+          -12.037,
+          -12.037
+        ],
+        "rmsDb": [
+          -31.882,
+          -31.882
+        ],
+        "lufsIntegrated": -23.583
+      }
+    },
+    "Bell": {
+      "vel110": {
+        "peakDb": [
+          -6.658,
+          -6.658
+        ],
+        "rmsDb": [
+          -19.629,
+          -19.629
+        ],
+        "lufsIntegrated": -10.74
+      },
+      "vel40": {
+        "peakDb": [
+          -11.57,
+          -11.57
+        ],
+        "rmsDb": [
+          -24.979,
+          -24.979
+        ],
+        "lufsIntegrated": -17.012
+      }
+    },
+    "Clav": {
+      "vel110": {
+        "peakDb": [
+          -6.915,
+          -6.915
+        ],
+        "rmsDb": [
+          -29.428,
+          -29.428
+        ],
+        "lufsIntegrated": -16.614
+      },
+      "vel40": {
+        "peakDb": [
+          -12.773,
+          -12.773
+        ],
+        "rmsDb": [
+          -34.495,
+          -34.495
+        ],
+        "lufsIntegrated": -22.271
+      }
+    },
+    "Pop Pluck": {
+      "vel110": {
+        "peakDb": [
+          -6.65,
+          -6.65
+        ],
+        "rmsDb": [
+          -30.2,
+          -30.2
+        ],
+        "lufsIntegrated": -20.55
+      },
+      "vel40": {
+        "peakDb": [
+          -12.606,
+          -12.606
+        ],
+        "rmsDb": [
+          -36.062,
+          -36.062
+        ],
+        "lufsIntegrated": -26.684
+      }
+    },
+    "Arp Bleep": {
+      "vel110": {
+        "peakDb": [
+          -7.76,
+          -7.76
+        ],
+        "rmsDb": [
+          -32.114,
+          -32.114
+        ],
+        "lufsIntegrated": -22.341
+      },
+      "vel40": {
+        "peakDb": [
+          -13.096,
+          -13.096
+        ],
+        "rmsDb": [
+          -36.846,
+          -36.846
+        ],
+        "lufsIntegrated": -27.534
+      }
+    },
+    "Brass Stab": {
+      "vel110": {
+        "peakDb": [
+          -3.89,
+          -3.89
+        ],
+        "rmsDb": [
+          -18.328,
+          -18.328
+        ],
+        "lufsIntegrated": -9.331
+      },
+      "vel40": {
+        "peakDb": [
+          -8.443,
+          -8.443
+        ],
+        "rmsDb": [
+          -25.441,
+          -25.441
+        ],
+        "lufsIntegrated": -16.773
+      }
+    },
+    "Synth Brass": {
+      "vel110": {
+        "peakDb": [
+          -3.901,
+          -3.901
+        ],
+        "rmsDb": [
+          -17.53,
+          -17.53
+        ],
+        "lufsIntegrated": -8.652
+      },
+      "vel40": {
+        "peakDb": [
+          -8.472,
+          -8.472
+        ],
+        "rmsDb": [
+          -24.085,
+          -24.085
+        ],
+        "lufsIntegrated": -15.238
+      }
+    },
+    "Saw Lead": {
+      "vel110": {
+        "peakDb": [
+          -7.506,
+          -7.506
+        ],
+        "rmsDb": [
+          -20.265,
+          -20.265
+        ],
+        "lufsIntegrated": -9.453
+      },
+      "vel40": {
+        "peakDb": [
+          -12.718,
+          -12.718
+        ],
+        "rmsDb": [
+          -22.819,
+          -22.819
+        ],
+        "lufsIntegrated": -12.603
+      }
+    },
+    "Square Lead": {
+      "vel110": {
+        "peakDb": [
+          -7.522,
+          -7.522
+        ],
+        "rmsDb": [
+          -17.221,
+          -17.221
+        ],
+        "lufsIntegrated": -7.264
+      },
+      "vel40": {
+        "peakDb": [
+          -12.805,
+          -12.805
+        ],
+        "rmsDb": [
+          -22.722,
+          -22.722
+        ],
+        "lufsIntegrated": -12.889
+      }
+    },
+    "Soft Pad": {
+      "vel110": {
+        "peakDb": [
+          -5.022,
+          -5.022
+        ],
+        "rmsDb": [
+          -19.421,
+          -19.421
+        ],
+        "lufsIntegrated": -11.778
+      },
+      "vel40": {
+        "peakDb": [
+          -9.029,
+          -9.029
+        ],
+        "rmsDb": [
+          -23.737,
+          -23.737
+        ],
+        "lufsIntegrated": -15.566
+      }
+    },
+    "Organ": {
+      "vel110": {
+        "peakDb": [
+          -5.864,
+          -5.864
+        ],
+        "rmsDb": [
+          -18.488,
+          -18.488
+        ],
+        "lufsIntegrated": -8.725
+      },
+      "vel40": {
+        "peakDb": [
+          -9.264,
+          -9.264
+        ],
+        "rmsDb": [
+          -22.038,
+          -22.038
+        ],
+        "lufsIntegrated": -12.271
+      }
+    }
+  }
+}
