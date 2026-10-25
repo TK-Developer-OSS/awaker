@@ -23,6 +23,17 @@ the Electron main process.
 - **Cubase in, Awaker finishes.** Import a DAWproject exported from Cubase 14+ (tracks, clips,
   fades, volume / pan, MIDI) — MIDI tracks play through a built-in GPU synth — and export one back.
   MIDI files, a piano roll, MIDI in / out and a control surface (MCU) are supported too.
+- **Instrument tracks, rendered on the GPU.** A MIDI track can be played by a built-in instrument that renders its
+  notes straight into VRAM (no CPU sample array); the result is an ordinary audio source, so the channel strip,
+  inserts, fader and mix apply as for any track. Only the notes and the instrument's parameters are saved; the audio is
+  rendered again when the project loads or a note changes. Instruments (swap one for another and the notes, strip and
+  inserts stay): **Simple Synth** (two oscillators plus a sub, band-limited saw / square, ADSR, low-pass), **FM Synth**
+  (four operators with a routing matrix, 18 factory presets, click / pitch-punch / index macros, aimed at crisp
+  transients), **EarlySynth** (the first FM synth, kept frozen as it was) and a **Drum Machine** (22 analogue-style
+  drum and hand-percussion voices — synthesised, not sampled — with a step sequencer and preset patterns). Edit notes in
+  the piano roll, import / export Standard MIDI Files, record from a MIDI keyboard, or send a track's notes out to a
+  hardware or software synth. The voices are closed-form per frame, so the same kernels can later be driven block by
+  block for live playing.
 - **AI mix.** *AI MIX* (transport bar) asks the AI you connected to bring every track to a working level
   (about -18 dBFS RMS), tame what sticks out with the channel-strip compressors, and match the song's
   long-term average spectrum to a genre curve or to a reference song — from numbers the app measures
