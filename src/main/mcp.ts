@@ -140,7 +140,7 @@ const TOOLS: ToolSpec[] = [
     where: 'renderer',
     description:
       'Start / stop the live monitor session (device kept open, line-input tracks processed in real time while the transport is stopped). synthetic: "impulse" = a click every 4800 frames on both channels instead of hardware input (time-alignment test: see live_info.main.alignMaxErrFrames), "tone" = stereo tones, "off" = hardware.',
-    inputSchema: obj({ action: str('start | stop'), synthetic: str('off | tone | impulse'), latencyMs: { type: 'number' } }, ['action'])
+    inputSchema: obj({ action: str('start | stop'), synthetic: str('off | tone | impulse'), latencyMs: { type: 'number' }, block: num('live block size in frames: 256 | 512 | 1024 | 2048 | 4096 (stops the session first; measuring)') }, ['action'])
   },
   {
     name: 'live_info',
@@ -161,6 +161,13 @@ const TOOLS: ToolSpec[] = [
     inputSchema: obj({ path: str('absolute .mid path') }, ['path'])
   },
   {
+    name: 'midi_track_set',
+    where: 'renderer',
+    description:
+      'Route an instrument / MIDI track to the outside: `out` = the name (or part of it) of a MIDI output port, or "none"; `channel` 1-16; `outDelayMs` = the app-wide MIDI output delay in ms (negative = send MIDI earlier, to line up an external instrument whose audio comes back late). Returns the resulting settings and the ports found.',
+    inputSchema: obj({ track: num('track id (the instrument lane)'), out: str('output port name or part of it, or "none"'), channel: num('MIDI channel 1-16'), outDelayMs: num('app-wide MIDI out delay, ms (-200..500)') }, ['track'])
+  },
+  {
     name: 'midi_track_add',
     where: 'renderer',
     description:
@@ -169,7 +176,7 @@ const TOOLS: ToolSpec[] = [
       {
         name: str('track name'),
         bpm: { type: 'number' },
-        instrument: str('synth (default) | drums | earlysynth'),
+        instrument: str('synth (default) | drums | earlysynth | fm | none (no sound, external MIDI only)'),
         notes: {
           type: 'array',
           items: {
@@ -506,8 +513,8 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'ui_click',
     where: 'renderer',
-    description: 'Click the first element matching a CSS selector (buttons, tabs, menu rows).',
-    inputSchema: obj({ selector: str('CSS selector'), index: num('which match, default 0') }, ['selector'])
+    description: 'Click the first element matching a CSS selector (buttons, tabs, menu rows). pointer: true also sends pointerdown / pointerup first (what selects a track lane or mixer strip).',
+    inputSchema: obj({ selector: str('CSS selector'), index: num('which match, default 0'), pointer: bool('send pointerdown + pointerup before the click') }, ['selector'])
   },
   {
     name: 'screenshot',
@@ -554,6 +561,65 @@ const TOOLS: ToolSpec[] = [
     name: 'audio_devices',
     where: 'main',
     description: 'Native audio devices (RtAudio / WASAPI view): ids, channel counts, sample rates.',
+    inputSchema: obj({})
+  },
+  {
+    name: 'audio_inputs',
+    where: 'main',
+    description: 'WASAPI recording (input) devices (inputChannels > 0): ids, names, channel counts, sample rates, and the default input id.',
+    inputSchema: obj({})
+  },
+  {
+    name: 'return_start',
+    where: 'main',
+    description:
+      'Start the secondary WASAPI shared-mode return input (or a synthetic sine/impulse test source) and route it into the live path with drift compensation. Pick a device by `deviceId` (from audio_inputs) or `deviceName`, or pass `synthetic: true | "sine" | "impulse"` (and optional `driftPpm`) for verification.',
+    inputSchema: obj({
+      deviceId: num('WASAPI input device id from audio_inputs'),
+      deviceName: str('substring of the WASAPI input device name'),
+      delayMs: num('manual delay offset in ms (-100..500)'),
+      synthetic: { description: 'true / "sine" for stereo 440/660 Hz test tones, "impulse" for click alignment test', anyOf: [{ type: 'boolean' }, { type: 'string' }] },
+      driftPpm: num('simulated clock drift in ppm for synthetic mode (-450..450)')
+    })
+  },
+  {
+    name: 'return_stop',
+    where: 'main',
+    description: 'Stop the secondary WASAPI return input and release the external live path.',
+    inputSchema: obj({})
+  },
+  {
+    name: 'return_status',
+    where: 'main',
+    description:
+      'Status and numerical telemetry of the secondary WASAPI return input: connection state, received/injected frames, ring buffer occupancy (fillRatio, ringBufferedFrames/ringTargetFrames), drift compensation (resampleRatio, ppm), underruns/overruns, clockDeltaFrames, and delayMs (pass delayMs to update it live).',
+    inputSchema: obj({
+      delayMs: num('optional: update the manual delay offset in ms (-100..500)')
+    })
+  },
+  {
+    name: 'vst_listen',
+    where: 'main',
+    description:
+      'VST host bridge (proof of concept): start listening for an out-of-process VST3 host on 127.0.0.1. Returns {port, token, sampleRate, block}; start the host with those (it connects, loads `plugin`, and feeds the live path). Add a line-input track (live_lane_add) and start the monitor to hear it.',
+    inputSchema: obj({ plugin: str('absolute path of the .vst3 the host should load') }, ['plugin'])
+  },
+  {
+    name: 'vst_note',
+    where: 'main',
+    description: 'Play one note through the VST host now (test hook): key 0-127, vel 1-127, durMs, MIDI channel 1-16.',
+    inputSchema: obj({ key: num('0-127'), vel: num('1-127'), durMs: num('note length, ms'), channel: num('1-16') }, ['key'])
+  },
+  {
+    name: 'vst_status',
+    where: 'main',
+    description: 'VST host bridge health: connected / ready, host round trip per block (mean / max) against the block budget, late events, resyncs.',
+    inputSchema: obj({})
+  },
+  {
+    name: 'vst_stop',
+    where: 'main',
+    description: 'Stop the VST host bridge (tells the host to quit, releases the live path).',
     inputSchema: obj({})
   },
   {
@@ -636,6 +702,9 @@ async function callRenderer(win: BrowserWindow | null, tool: string, args: unkno
 export interface McpDeps {
   getWin: () => BrowserWindow | null
   listDevices: () => unknown
+  listInputs?: () => unknown
+  vst?: import('./vst-bridge').VstBridge
+  returnIn?: import('./return-in').ReturnIn
 }
 
 type Content = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
@@ -680,6 +749,52 @@ async function runMainTool(name: string, args: Record<string, unknown>, deps: Mc
     }
     case 'audio_devices':
       return text(deps.listDevices())
+    case 'audio_inputs':
+      return text(deps.listInputs ? deps.listInputs() : { devices: [], defaultInput: 0 })
+    case 'return_start': {
+      if (!deps.returnIn) throw new Error('return input is not available')
+      const syn = args['synthetic']
+      return text(
+        deps.returnIn.start({
+          deviceId: args['deviceId'] !== undefined ? Number(args['deviceId']) : undefined,
+          deviceName: typeof args['deviceName'] === 'string' ? args['deviceName'] : undefined,
+          delayMs: args['delayMs'] !== undefined ? Number(args['delayMs']) : undefined,
+          synthetic: syn === 'impulse' ? 'impulse' : syn === 'sine' || syn === true || syn === 'true' ? 'sine' : false,
+          driftPpm: args['driftPpm'] !== undefined ? Number(args['driftPpm']) : undefined
+        })
+      )
+    }
+    case 'return_stop':
+      if (!deps.returnIn) throw new Error('return input is not available')
+      return text(deps.returnIn.stop())
+    case 'return_status':
+      if (!deps.returnIn) return text({ running: false, mode: 'off' })
+      if (args['delayMs'] !== undefined) return text(deps.returnIn.setDelayMs(Number(args['delayMs'])))
+      return text(deps.returnIn.status())
+    case 'vst_listen': {
+      const plugin = String(args['plugin'] ?? '')
+      if (!/\.vst3$/i.test(plugin)) throw new Error('plugin must be a .vst3 path')
+      if (!deps.vst) throw new Error('VST bridge is not available')
+      return text(await deps.vst.listen(plugin))
+    }
+    case 'vst_note': {
+      if (!deps.vst) throw new Error('VST bridge is not available')
+      const key = Math.max(0, Math.min(127, Number(args['key']) | 0))
+      const vel = Math.max(1, Math.min(127, Number(args['vel']) || 100))
+      const dur = Math.max(10, Math.min(10000, Number(args['durMs']) || 500))
+      const ch = Math.max(1, Math.min(16, Number(args['channel']) | 0 || 1)) - 1
+      const t = performance.timeOrigin + performance.now()
+      deps.vst.midi([
+        { t, st: 0x90 | ch, d1: key, d2: vel },
+        { t: t + dur, st: 0x80 | ch, d1: key, d2: 0 }
+      ])
+      return text({ key, vel, durMs: dur })
+    }
+    case 'vst_status':
+      return text(deps.vst ? deps.vst.status() : { listening: false })
+    case 'vst_stop':
+      deps.vst?.stop()
+      return text('stopped')
     case 'ops_log': {
       const limit = Math.min(100, Math.max(1, Number(args['limit']) || 20))
       const kind = args['kind'] === 'turn' || args['kind'] === 'tool' ? String(args['kind']) : 'all'

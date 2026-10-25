@@ -38,8 +38,15 @@ export interface LiveLane {
 }
 
 /** Frames processed per GPU pass: small enough for low latency, large enough to be cheap per block. */
-export const LIVE_BLOCK = 512
+export let LIVE_BLOCK = 1024
+/** Change the block size (experiments / measuring): only while no live session is running. Powers of two, 256..4096. */
+export function setLiveBlock(n: number): number {
+  LIVE_BLOCK = [256, 512, 1024, 2048, 4096].includes(n) ? n : 512
+  return LIVE_BLOCK
+}
 const MAX_QUEUE = 6
+/** Blocks in flight on the GPU at once (submitted, readback pending). */
+const LIVE_DEPTH = 3
 
 export interface LiveStats {
   /** Blocks processed / dropped because the GPU fell behind. */
@@ -58,12 +65,14 @@ export class LiveBus {
   private nextStart = -1
   private channels = 0
   private queue: { start: number; data: Float32Array }[] = []
-  private busy = false
+  private inflight = 0
   private bufs = new Map<number, { l: GPUBuffer; r: GPUBuffer }>()
   private procSum = 0
   private procMax = 0
   blocks = 0
   dropped = 0
+  private peaks = new Map<number, { v: number; at: number }>()
+  private outPk = { v: 0, at: 0 }
   /** Output position = input position + this many ms (accumulate + process + IPC head-room). */
   latencyMs = 0
 
@@ -72,12 +81,29 @@ export class LiveBus {
     private masterGain: () => number
   ) {}
 
+  /** Post-fader peak (linear) of a live lane's last processed block, for its channel meter; 0 once blocks stop arriving. */
+  peakOf(id: number): number {
+    const p = this.peaks.get(id)
+    return p && performance.now() - p.at < 250 ? p.v : 0
+  }
+
+  /** Peak (linear) of the live mix after the master fader, for the master meter; 0 once blocks stop arriving. */
+  outPeak(): number {
+    return performance.now() - this.outPk.at < 250 ? this.outPk.v : 0
+  }
+
   /** Fresh start (stream reopened: input frame counter restarts at 0). */
   reset(): void {
     this.chunks = []
     this.accFrames = 0
     this.nextStart = -1
     this.queue = []
+    // lane buffers are LIVE_BLOCK frames long: rebuild them (the size may have changed)
+    for (const b of this.bufs.values()) {
+      b.l.destroy()
+      b.r.destroy()
+    }
+    this.bufs.clear()
     this.bus.resetStrips()
     this.bus.resetInserts()
     // each live lane's own inserts hold delay lines / filter memory too
@@ -136,6 +162,11 @@ export class LiveBus {
     this.autoExtraMs = Math.min(maxExtraMs, this.autoExtraMs + stepMs)
   }
 
+  /** Calm for a while: hand back part of the head-room learned earlier (down to the one-block + 15 ms floor). */
+  relaxAuto(stepMs = 2.5): void {
+    this.autoExtraMs = Math.max(0, this.autoExtraMs - stepMs)
+  }
+
   stats(): LiveStats {
     return {
       blocks: this.blocks,
@@ -188,16 +219,22 @@ export class LiveBus {
     void this.drain(sr)
   }
 
-  private async drain(sr: number): Promise<void> {
-    if (this.busy) return
-    this.busy = true
-    try {
-      while (this.queue.length) {
-        const b = this.queue.shift()!
-        await this.process(b.start, b.data, sr)
-      }
-    } finally {
-      this.busy = false
+  /**
+   * Start queued blocks, up to `LIVE_DEPTH` at a time. A block's cost is mostly the wait for its readback, not
+   * GPU work, so overlapping them lifts the ceiling from "one block per round trip" to the GPU's own throughput.
+   * Order is kept by the GPU queue (strip / insert state advances in submission order); the results carry
+   * their frame numbers, so completion order does not matter either.
+   */
+  private drain(sr: number): void {
+    while (this.queue.length && this.inflight < LIVE_DEPTH) {
+      const b = this.queue.shift()!
+      this.inflight++
+      this.process(b.start, b.data, sr)
+        .catch((err) => console.error('[live] block failed:', err))
+        .finally(() => {
+          this.inflight--
+          this.drain(sr)
+        })
     }
   }
 
@@ -255,6 +292,15 @@ export class LiveBus {
     })
     this.bus.masterGain = this.masterGain()
     const out = await this.bus.renderBlock(sources, start, LIVE_BLOCK, sr)
+    const pk = this.bus.trackPeaks
+    const at = performance.now()
+    lanes.forEach((ln, i) => this.peaks.set(ln.id, { v: pk[i] || 0, at }))
+    let mp = 0
+    for (let i = 0; i < out.length; i++) {
+      const a = Math.abs(out[i])
+      if (a > mp) mp = a
+    }
+    this.outPk = { v: mp, at }
     // renderBlock reuses its output array — copy before it goes over IPC
     if (send) {
       const copy = out.slice()

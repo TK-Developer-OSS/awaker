@@ -140,6 +140,10 @@ export class NativeAudioOut {
   private liveRing = new LiveRing(1)
   /** Frames the output callback has played since begin() — the clock live blocks are placed on. */
   private outFrames = 0
+  private outFrameAt = 0
+  /** An external source (VST host bridge) feeds the live path; the device input stays out of it. */
+  private extLive = false
+  private extAlignProbe = false
   private livePendingIn: Float32Array[] = []
   private livePendingFrames = 0
   private livePendingStart = 0
@@ -159,6 +163,87 @@ export class NativeAudioOut {
   listDevices(): { devices: RtAudioDeviceInfo[]; defaultOutput: number } {
     const rt = this.rt ?? new RtAudio(RtAudioApi.WINDOWS_WASAPI)
     return { devices: rt.getDevices(), defaultOutput: rt.getDefaultOutputDevice() }
+  }
+
+  /** WASAPI recording (input) devices, independent of which backend the output stream opened on. */
+  listInputDevices(): { devices: RtAudioDeviceInfo[]; defaultInput: number } {
+    const rt = new RtAudio(RtAudioApi.WINDOWS_WASAPI)
+    try {
+      const devices = rt.getDevices().filter((d) => d.inputChannels > 0)
+      return { devices, defaultInput: rt.getDefaultInputDevice() }
+    } finally {
+      ;(rt as { dispose?: () => void }).dispose?.()
+    }
+  }
+
+  /** Open a secondary WASAPI shared-mode recording stream (e.g. a virtual audio cable return). */
+  openWasapiInput(
+    deviceId: number | undefined,
+    deviceName: string | undefined,
+    sampleRate: number,
+    blockFrames: number,
+    onData: (interleaved: Float32Array, channels: number) => void,
+    onError: (msg: string) => void
+  ): { close(): void; deviceId: number; deviceName: string; sampleRate: number; channels: number } {
+    const rt = new RtAudio(RtAudioApi.WINDOWS_WASAPI)
+    const devs = rt.getDevices().filter((d) => d.inputChannels > 0)
+    let dev: RtAudioDeviceInfo | undefined
+    if (deviceId != null && deviceId > 0) dev = devs.find((d) => d.id === deviceId)
+    if (!dev && deviceName) {
+      const q = deviceName.toLowerCase()
+      dev = devs.find((d) => d.name.toLowerCase().includes(q))
+    }
+    if (!dev) {
+      const def = rt.getDefaultInputDevice()
+      dev = devs.find((d) => d.id === def) ?? devs[0]
+    }
+    if (!dev) {
+      ;(rt as { dispose?: () => void }).dispose?.()
+      throw new Error('no WASAPI recording device found')
+    }
+    const channels = Math.min(2, dev.inputChannels)
+    // Open at the device's native mix rate (`preferredSampleRate`) so RtAudio's internal WASAPI capture
+    // loop runs 1:1 without dropping sub-blocks; DriftRing resamples smoothly to the project rate.
+    const openRate = dev.preferredSampleRate || sampleRate
+    let closed = false
+    const close = (): void => {
+      if (closed) return
+      closed = true
+      try {
+        if (rt.isStreamRunning()) rt.stop()
+        if (rt.isStreamOpen()) rt.closeStream()
+      } catch {
+        /* ignore */
+      } finally {
+        ;(rt as { dispose?: () => void }).dispose?.()
+      }
+    }
+    try {
+      rt.openStream(
+        null,
+        { deviceId: dev.id, nChannels: channels, firstChannel: 0 },
+        RtAudioFormat.RTAUDIO_FLOAT32,
+        openRate,
+        blockFrames || 512,
+        'awaker-return',
+        (buf: Buffer) => {
+          const f = new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))
+          onData(f, channels)
+        },
+        null,
+        0,
+        (_type, msg) => {
+          if (BENIGN_RT.test(msg)) return
+          onError(msg)
+        }
+      )
+      rt.start()
+      const actualRate = rt.getStreamSampleRate?.() || openRate
+      return { close, deviceId: dev.id, deviceName: dev.name, sampleRate: actualRate, channels }
+    } catch (err) {
+      close()
+      throw err
+    }
   }
 
   /** Ordered open attempts. Env overrides: DAW_AUDIO_API, DAW_AUDIO_DEVICE. */
@@ -424,6 +509,38 @@ export class NativeAudioOut {
 
   // ---- live (line-input) path ----------------------------------------------------
 
+  setExternalLive(on: boolean): void {
+    this.extLive = on
+    this.livePendingIn = []
+    this.livePendingFrames = 0
+    this.alignImpulses = 0
+    this.alignMaxErr = 0
+  }
+  setAlignProbe(on: boolean): void {
+    this.extAlignProbe = on
+  }
+  /** Output frames played since begin(): the clock an external live source is paced against. */
+  get outClock(): number {
+    return this.outFrames
+  }
+  /** Sub-block interpolated output clock bounded to the current hardware block. */
+  get smoothOutClock(): number {
+    if (!this.running || this.outFrameAt <= 0) return this.outFrames
+    const dt = Math.max(0, (performance.now() - this.outFrameAt) / 1000)
+    const interp = Math.min(this.blockFrames, Math.floor(dt * this.sampleRate))
+    return this.outFrames + interp
+  }
+  get isRunning(): boolean {
+    return this.running
+  }
+  get rate(): number {
+    return this.sampleRate
+  }
+  /** One block of an external live source (interleaved f32 stereo) captured at `start` on the output clock. */
+  injectLive(f: Float32Array, start: number): void {
+    this.liveIn(f, start, 2)
+  }
+
   /** The renderer turns this on while it has live lanes; off = no per-callback cost. */
   setLiveEnabled(on: boolean): void {
     this.liveEnabled = on
@@ -434,6 +551,7 @@ export class NativeAudioOut {
     // 1 s of landing space: enough for any latency we would ever ask for, small enough to stay cache-warm
     this.liveRing = new LiveRing(Math.max(1024, this.sampleRate))
     this.outFrames = 0
+    this.outFrameAt = performance.now()
     this.livePendingIn = []
     this.livePendingFrames = 0
     this.liveStamps.clear()
@@ -466,6 +584,10 @@ export class NativeAudioOut {
   /** Batch device-sized input blocks to ~256 frames, then hand them to the renderer's live bus. */
   private liveIn(f: Float32Array, start: number, nCh: number): void {
     if (!this.liveEnabled || !this.onLiveInput) return
+    if (this.livePendingFrames > 0 && start !== this.livePendingStart + this.livePendingFrames) {
+      this.livePendingIn = []
+      this.livePendingFrames = 0
+    }
     if (this.livePendingFrames === 0) this.livePendingStart = start
     this.livePendingIn.push(f)
     this.livePendingFrames += f.length / nCh
@@ -490,7 +612,7 @@ export class NativeAudioOut {
     const f = new Float32Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))
     const start = this.inputFrames
     this.inputFrames += f.length / nCh
-    this.liveIn(f, start, nCh)
+    if (!this.extLive) this.liveIn(f, start, nCh)
     this.onInput(f, start, nCh)
   }
 
@@ -512,7 +634,7 @@ export class NativeAudioOut {
       }
     }
     this.inputFrames += frames
-    this.liveIn(f, start, 2)
+    if (!this.extLive) this.liveIn(f, start, 2)
     this.onInput(f, start, 2)
   }
 
@@ -554,13 +676,14 @@ export class NativeAudioOut {
     }
     this.playedFrames += need
     this.outFrames += need
+    this.outFrameAt = performance.now()
   }
 
   /** Add the live blocks that fall in this output block (frames outFrames .. outFrames+need) onto outScratch. */
   private addLive(need: number): void {
     if (!this.liveEnabled) return
     // the synthetic-impulse self-test reads the live contribution on its own
-    const probe = this.synthKind === 'impulse' && this.inputSynthetic ? new Float32Array(need * 2) : null
+    const probe = (this.synthKind === 'impulse' && this.inputSynthetic) || this.extAlignProbe ? new Float32Array(need * 2) : null
     const any = probe
       ? this.liveRing.take(this.outFrames, need, probe)
       : this.liveRing.take(this.outFrames, need, this.outScratch)

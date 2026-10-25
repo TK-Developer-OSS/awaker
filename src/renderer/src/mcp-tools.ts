@@ -7,6 +7,7 @@ import { FM_PRESET_NAMES } from './gpu/instruments/fm-presets'
 import { EARLY_PRESET_NAMES } from './gpu/instruments/earlysynth/presets'
 import { PRESETS as DRUM_PATTERNS } from './midi/step-logic'
 import { initMcpGuard } from './ui/mcp-guard'
+import { setLiveBlock } from './audio/live-bus'
 import { genreChoices, getMixTarget, setMixGenre } from './audio/mix-target'
 import { landLoudness } from './audio/loudness-land'
 import { planHeadroom } from './audio/headroom'
@@ -98,6 +99,7 @@ export interface McpCtx {
   /** Average spectrum of the mix (and, for scope 'breakdown', of each part) against the AI-mix target. */
   analyzeSpectrum(req: { scope?: string; startSeconds?: number; seconds?: number }): Promise<unknown>
   addInstrumentTrack(name: string, notes: { start: number; dur: number; key: number; vel?: number }[], bpm?: number, kind?: string): McpLane
+  midiTrackSet(laneId: number, patch: { out?: string; channel?: number; outDelayMs?: number }): unknown
   setInstrumentParams(laneId: number, patch: Record<string, unknown>): unknown
   swapInstrument(laneId: number, kind: string): string
   addWavLane(path: string, title?: string): Promise<McpLane | null>
@@ -374,6 +376,10 @@ export function registerMcpTools(ctx: McpCtx): void {
 
     monitor: async (a) => {
       const syn = String(a['synthetic'] ?? 'off')
+      if (a['block'] !== undefined) {
+        await ctx.monitor('stop', false)
+        setLiveBlock(finite(a['block'], 'block'))
+      }
       return ctx.monitor(
         String(a['action']) === 'stop' ? 'stop' : 'start',
         syn === 'impulse' ? 'impulse' : syn === 'tone' || syn === 'true' ? true : false,
@@ -576,6 +582,13 @@ export function registerMcpTools(ctx: McpCtx): void {
       return { applied: out }
     },
 
+    midi_track_set: (a) =>
+      ctx.midiTrackSet(finite(a['track'], 'track'), {
+        out: a['out'] === undefined ? undefined : String(a['out']),
+        channel: a['channel'] === undefined ? undefined : finite(a['channel'], 'channel'),
+        outDelayMs: a['outDelayMs'] === undefined ? undefined : finite(a['outDelayMs'], 'outDelayMs')
+      }),
+
     midi_track_add: (a) => {
       const raw = Array.isArray(a['notes']) ? (a['notes'] as Record<string, unknown>[]) : []
       const notes = raw.map((n) => ({
@@ -702,6 +715,9 @@ export function registerMcpTools(ctx: McpCtx): void {
       const els = document.querySelectorAll<HTMLElement>(String(a['selector']))
       const e = els[Number(a['index']) || 0]
       if (!e) throw new Error(`no element for selector (${els.length} matches)`)
+      if (a['pointer']) {
+        for (const t of ['pointerdown', 'pointerup']) e.dispatchEvent(new PointerEvent(t, { bubbles: true, pointerId: 1, isPrimary: true }))
+      }
       e.click()
       return { clicked: true, matches: els.length }
     }

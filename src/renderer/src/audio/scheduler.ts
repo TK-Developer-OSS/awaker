@@ -114,6 +114,8 @@ export class PlaybackScheduler {
   liveSynthetic: boolean | 'impulse' = false
   private liveLateSeen = 0
   private liveBumpAt = 0
+  private liveLateAt = 0
+  private liveRelaxAt = 0
   /** The user wants the device kept open for monitoring while the transport is stopped. */
   private monitorWanted = false
   /** A monitor-only stream (no transport) is currently open. */
@@ -202,9 +204,16 @@ export class PlaybackScheduler {
     const lb = this.liveBus
     if (lb && s.live.enabled && !lb.latencyMs) {
       const now = performance.now()
-      if (s.live.late > this.liveLateSeen && now - this.liveBumpAt > 1000) {
-        lb.bumpAuto()
-        this.liveBumpAt = now
+      if (s.live.late > this.liveLateSeen) {
+        this.liveLateAt = now
+        if (now - this.liveBumpAt > 1000) {
+          lb.bumpAuto()
+          this.liveBumpAt = now
+        }
+      } else if (now - this.liveLateAt > 8000 && now - this.liveRelaxAt > 2000) {
+        // calm for a while: give some of the margin back (it widens again by itself if blocks start arriving late)
+        lb.relaxAuto()
+        this.liveRelaxAt = now
       }
     }
     this.liveLateSeen = s.live.late

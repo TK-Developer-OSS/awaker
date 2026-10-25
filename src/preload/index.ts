@@ -64,6 +64,7 @@ export interface AudioDeviceInfo {
   inputChannels: number
   outputChannels: number
   isDefaultOutput: number
+  isDefaultInput?: number
   sampleRates: number[]
   preferredSampleRate: number
 }
@@ -148,6 +149,10 @@ const api = {
 
   listAudioDevices: (): Promise<{ devices: AudioDeviceInfo[]; defaultOutput: number }> =>
     ipcRenderer.invoke('daw:audio:devices'),
+
+  /** WASAPI recording (input) devices (inputChannels > 0). */
+  listAudioInputs: (): Promise<{ devices: AudioDeviceInfo[]; defaultInput: number }> =>
+    ipcRenderer.invoke('daw:audio:inputs'),
 
   /** Open the native output stream. */
   audioStart: (cfg: AudioOutConfig): Promise<AudioOutStatus> => ipcRenderer.invoke('daw:audio:start', cfg),
@@ -261,6 +266,53 @@ const api = {
   /** Stem export: write one .wav into that folder (bare file name only). */
   exportWriteFile: (dir: string, name: string, bytes: ArrayBuffer): Promise<{ ok: true; path: string } | { ok: false; error: string }> =>
     ipcRenderer.invoke('daw:export:writeFile', dir, name, bytes),
+
+  /** VST host bridge (proof of concept): health, wait for a host, stop, installed .vst3 list, MIDI to the host. */
+  vstStatus: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('daw:vst:status'),
+  vstListen: (plugin: string): Promise<{ port: number; token: string; sampleRate: number; block: number }> =>
+    ipcRenderer.invoke('daw:vst:listen', plugin),
+  vstStop: (): Promise<void> => ipcRenderer.invoke('daw:vst:stop'),
+  vstScan: (): Promise<{ name: string; path: string }[]> => ipcRenderer.invoke('daw:vst:scan'),
+  vstMidi: (events: { t: number; st: number; d1: number; d2: number }[]): void => ipcRenderer.send('daw:vst:midi', events),
+
+  /** Secondary WASAPI return input (virtual audio cable return): start, stop, delay offset, status. */
+  returnStatus: (): Promise<{
+    running: boolean
+    mode: 'off' | 'wasapi' | 'synthetic'
+    deviceId: number
+    deviceName: string
+    sampleRate: number
+    outputSampleRate: number
+    channels: number
+    delayMs: number
+    offsetFrames: number
+    receivedFrames: number
+    injectedFrames: number
+    injectedBlocks: number
+    ringBufferedFrames: number
+    ringTargetFrames: number
+    ringCapacityFrames: number
+    fillRatio: number
+    smoothFillFrames: number
+    resampleRatio: number
+    ppm: number
+    underruns: number
+    overruns: number
+    resyncs: number
+    clockDeltaFrames: number
+    peakL: number
+    peakR: number
+    error: string
+  }> => ipcRenderer.invoke('daw:return:status'),
+  returnStart: (cfg: {
+    deviceId?: number
+    deviceName?: string
+    delayMs?: number
+    synthetic?: boolean | 'sine' | 'impulse'
+    driftPpm?: number
+  }): Promise<Record<string, unknown>> => ipcRenderer.invoke('daw:return:start', cfg),
+  returnStop: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('daw:return:stop'),
+  returnSetDelay: (delayMs: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('daw:return:delay', delayMs),
 
   /** File-menu commands (new/open/save/saveas/import-*, export-*). */
   onFileCommand: (cb: (op: string) => void): (() => void) => {

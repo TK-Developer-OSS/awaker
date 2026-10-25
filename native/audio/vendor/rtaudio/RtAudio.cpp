@@ -5683,26 +5683,27 @@ void RtApiWasapi::wasapiThread()
     captureSrRatio = ( ( float ) captureFormat->nSamplesPerSec / stream_.sampleRate );
 
     if ( !captureClient ) {
+      HRESULT hr3 = E_NOINTERFACE;
       ComPtr<IAudioClient3> captureAudioClient3 = nullptr;
       captureAudioClient->QueryInterface( __uuidof( IAudioClient3 ), ( void** ) &captureAudioClient3 );
       if ( captureAudioClient3 && !loopbackEnabled )
       {
-        UINT32 Ignore;
-        UINT32 MinPeriodInFrames;
-        hr = captureAudioClient3->GetSharedModeEnginePeriod( captureFormat,
-                                                             &Ignore,
-                                                             &Ignore,
-                                                             &MinPeriodInFrames,
-                                                             &Ignore );
-        if ( FAILED( hr ) ) {
-          errorText = "RtApiWasapi::wasapiThread: Unable to initialize capture audio client.";
-          goto Exit;
+        UINT32 defP = 0, fundP = 0, minP = 0, maxP = 0;
+        hr3 = captureAudioClient3->GetSharedModeEnginePeriod( captureFormat,
+                                                              &defP,
+                                                              &fundP,
+                                                              &minP,
+                                                              &maxP );
+        if ( SUCCEEDED( hr3 ) ) {
+          hr3 = captureAudioClient3->InitializeSharedAudioStream( AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                                  minP,
+                                                                  captureFormat,
+                                                                  NULL );
         }
-        
-        hr = captureAudioClient3->InitializeSharedAudioStream( AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                                               MinPeriodInFrames,
-                                                               captureFormat,
-                                                               NULL );
+      }
+      if ( SUCCEEDED( hr3 ) )
+      {
+        hr = hr3;
       }
       else
       {

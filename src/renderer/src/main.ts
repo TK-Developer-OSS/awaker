@@ -3,10 +3,11 @@
 // Generated with Claude Code (https://claude.com/claude-code)
 
 import { initGpu } from './gpu/device'
+import { isSoftwareAdapter, type AdapterInfoLike } from './gpu/software-adapter'
 import { GpuTrack } from './gpu/track'
 import { WaveformRenderer, type PeakClip } from './gpu/waveform-renderer'
 import { PlaybackScheduler } from './audio/scheduler'
-import { LiveBus, type LiveLane } from './audio/live-bus'
+import { LiveBus, LIVE_BLOCK, setLiveBlock, type LiveLane } from './audio/live-bus'
 import { initOptions } from './ui/options'
 import { initAddTrack } from './ui/add-track'
 import { fmtFaderDb } from './ui/fader-text'
@@ -90,6 +91,7 @@ import { FM_PRESET_NAMES } from './gpu/instruments/fm-presets'
 // EarlySynth: the frozen, independent copy of the first FM synth (own code, own shader)
 import { earlyPreset } from './gpu/instruments/earlysynth/earlysynth'
 import { EARLY_PRESET_NAMES } from './gpu/instruments/earlysynth/presets'
+import './gpu/instruments/external' // registers the "none" instrument (external MIDI only)
 import { MidiIo } from './midi/io'
 import { defaultSynthParams, type SynthParams, type SynthWave } from './gpu/instruments/synth'
 import { state, update, subscribe, type DawState } from './state'
@@ -104,8 +106,11 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
 
 const gpuStatus = $('gpu-status')
 const gpuLamp = $('gpu-lamp')
-/** The GPU lamp: green when WebGPU is up, red when it failed or the render loop stopped; `title` has the details. */
-const setGpuLamp = (state: 'ok' | 'err', detail: string): void => {
+/**
+ * The GPU lamp: green when WebGPU is up on a real GPU, dark ("off") when it runs in software (SwiftShader / WARP:
+ * it works, but on the CPU), red when it failed or the render loop stopped; `title` has the details.
+ */
+const setGpuLamp = (state: 'ok' | 'off' | 'err', detail: string): void => {
   gpuLamp.className = `lamp ${state}`
   gpuLamp.title = detail
 }
@@ -807,6 +812,7 @@ function openTrackEditor(mt: MidiTrack): void {
 let schedulerRef: PlaybackScheduler | null = null
 let liveBusRef: LiveBus | null = null
 const LIVE_LAT_KEY = 'awaker.liveLatencyMs'
+const LIVE_BLOCK_KEY = 'awaker.liveBlock'
 const REC_OFF_KEY = 'awaker.recOffsetMs'
 const readNum = (k: string, d: number): number => {
   try {
@@ -915,6 +921,35 @@ function buildLiveSection(lane: Lane): HTMLElement {
       writeNum(LIVE_LAT_KEY, v)
     })
   )
+  // Block size: bigger = more headroom against late blocks (needed with heavy strips / several lanes), at the cost of latency
+  const blkRow = document.createElement('label')
+  blkRow.style.cssText = rowCss
+  blkRow.title = 'Frames per live block. Larger blocks cope with heavier strips and more lanes but add latency (about one block). Applies at once when the monitor is on and the transport is stopped, otherwise at the next start.'
+  blkRow.append('Block')
+  const blkSel = document.createElement('select')
+  blkSel.style.cssText = inCss
+  for (const n of [512, 1024, 2048]) {
+    const o = document.createElement('option')
+    o.value = String(n)
+    o.textContent = `${n} fr` + (n === 512 ? ' (lowest latency)' : n === 2048 ? ' (safest)' : '')
+    blkSel.appendChild(o)
+  }
+  blkSel.value = String(LIVE_BLOCK)
+  blkSel.addEventListener('change', () => {
+    const n = Number(blkSel.value)
+    writeNum(LIVE_BLOCK_KEY, n)
+    const sch = schedulerRef
+    if (sch?.monitorOn && !state.playing) {
+      void sch.stopMonitor().then(() => {
+        setLiveBlock(n)
+        return sch.startMonitor()
+      })
+    } else {
+      setLiveBlock(n)
+    }
+  })
+  blkRow.appendChild(blkSel)
+  sec.appendChild(blkRow)
   sec.appendChild(
     num('Rec offset', 'Extra shift of recorded takes (positive = earlier), added to the device latency the driver reports. Calibrate with a loopback cable.', () => schedulerRef?.recOffsetMs ?? 0, (v) => {
       if (schedulerRef) schedulerRef.recOffsetMs = Math.max(-200, Math.min(500, v))
@@ -942,6 +977,285 @@ function buildLiveSection(lane: Lane): HTMLElement {
     window.setTimeout(refresh, 500)
   }
   window.setTimeout(refresh, 100)
+  return sec
+}
+
+const RETURN_DEV_KEY = 'awaker.returnInputDevice'
+const RETURN_DELAY_KEY = 'awaker.returnDelayMs'
+
+/**
+ * Detail-pane controls for the secondary WASAPI return input (virtual audio cable return):
+ * pick an input device, set manual delay compensation, start / stop, and watch ring fill + drift ratio.
+ */
+function buildReturnSection(lane: Lane): HTMLElement {
+  const sec = section('Return input (WASAPI)')
+  if (!lane.live) return sec
+  const rowCss = 'display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:11px;color:var(--dim)'
+  const inCss = 'flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 4px;font-size:11px'
+
+  const devRow = document.createElement('label')
+  devRow.style.cssText = rowCss
+  devRow.append('Device')
+  const sel = document.createElement('select')
+  sel.style.cssText = inCss
+  const none = document.createElement('option')
+  none.value = ''
+  none.textContent = '— choose input device —'
+  sel.appendChild(none)
+  let savedDev = ''
+  try {
+    savedDev = localStorage.getItem(RETURN_DEV_KEY) ?? ''
+  } catch {
+    /* storage unavailable */
+  }
+  void window.daw.listAudioInputs().then(({ devices, defaultInput }) => {
+    for (const d of devices) {
+      const o = document.createElement('option')
+      o.value = String(d.id)
+      o.textContent = `${d.name} (${d.inputChannels}ch)`
+      sel.appendChild(o)
+    }
+    if (savedDev && devices.some((d) => String(d.id) === savedDev)) {
+      sel.value = savedDev
+    } else if (defaultInput && devices.some((d) => d.id === defaultInput)) {
+      sel.value = String(defaultInput)
+    }
+  })
+  sel.addEventListener('change', () => {
+    try {
+      localStorage.setItem(RETURN_DEV_KEY, sel.value)
+    } catch {
+      /* storage unavailable */
+    }
+  })
+  devRow.appendChild(sel)
+  sec.appendChild(devRow)
+
+  const delayRow = document.createElement('label')
+  delayRow.style.cssText = rowCss
+  delayRow.title = 'Manual delay offset (ms) for virtual cable + buffer compensation on the return path.'
+  delayRow.append('Return delay')
+  const delayIn = document.createElement('input')
+  delayIn.type = 'number'
+  delayIn.step = '1'
+  delayIn.value = String(readNum(RETURN_DELAY_KEY, 0))
+  delayIn.style.cssText = inCss
+  delayIn.addEventListener('change', () => {
+    const v = Math.max(-100, Math.min(500, Number(delayIn.value) || 0))
+    delayIn.value = String(v)
+    writeNum(RETURN_DELAY_KEY, v)
+    void window.daw.returnSetDelay(v)
+  })
+  delayRow.append(delayIn, 'ms')
+  sec.appendChild(delayRow)
+
+  const btns = document.createElement('div')
+  btns.style.cssText = 'display:flex;gap:6px;margin:0 0 8px'
+  const startBtn = document.createElement('button')
+  startBtn.className = 'sat-mode'
+  startBtn.style.cssText = 'flex:1'
+  startBtn.textContent = 'Start return'
+  const stopBtn = document.createElement('button')
+  stopBtn.className = 'sat-mode'
+  stopBtn.style.cssText = 'flex:1'
+  stopBtn.textContent = 'Stop'
+  btns.append(startBtn, stopBtn)
+  sec.appendChild(btns)
+
+  const stateRow = document.createElement('div')
+  stateRow.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:11px;margin:0 0 6px'
+  const dot = document.createElement('span')
+  dot.style.cssText = 'width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none'
+  const stateText = document.createElement('span')
+  stateText.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'
+  stateRow.append(dot, stateText)
+  sec.appendChild(stateRow)
+
+  const stats = document.createElement('div')
+  stats.style.cssText = 'font-size:10px;color:var(--dim);line-height:1.5;font-family:monospace;white-space:pre-wrap'
+  sec.appendChild(stats)
+
+  startBtn.addEventListener('click', () => {
+    const id = Number(sel.value) || undefined
+    const delayMs = Number(delayIn.value) || 0
+    void window.daw.returnStart({ deviceId: id, delayMs })
+  })
+  stopBtn.addEventListener('click', () => {
+    void window.daw.returnStop()
+  })
+
+  const refresh = (): void => {
+    if (!stats.isConnected) return
+    void window.daw.returnStatus().then((st) => {
+      if (!st.running) {
+        dot.style.background = st.error ? '#ef4444' : 'var(--dim)'
+        stateText.textContent = st.error ? `Error: ${st.error}` : 'Disconnected'
+        stats.textContent = 'idle — pick an input device and press Start return'
+      } else {
+        dot.style.background = '#22c55e'
+        stateText.textContent = `${st.deviceName} (${st.sampleRate} Hz)`
+        const fillPct = Math.round(st.fillRatio * 100)
+        const sign = st.ppm >= 0 ? '+' : ''
+        stats.textContent =
+          `ring fill ${fillPct}% (${st.ringBufferedFrames}/${st.ringTargetFrames} fr)\n` +
+          `drift ratio ${st.resampleRatio.toFixed(6)} (${sign}${st.ppm.toFixed(1)} ppm)\n` +
+          `rx ${st.receivedFrames} fr · inj ${st.injectedFrames} fr · delay ${st.delayMs} ms\n` +
+          `underrun ${st.underruns} · overrun ${st.overruns} · resync ${st.resyncs}`
+      }
+      window.setTimeout(refresh, 500)
+    })
+  }
+  window.setTimeout(refresh, 100)
+  return sec
+}
+
+const VST_PLUGIN_KEY = 'awaker.vstPlugin'
+
+/**
+ * Detail-pane controls for the VST host bridge (proof of concept, see main/vst-bridge.ts): pick a
+ * plugin, wait for the out-of-process host, watch its timing. The host's sound enters the live path,
+ * so it plays through this line-input track's strip + inserts.
+ */
+function buildVstSection(lane: Lane): HTMLElement {
+  const sec = section('VST host (PoC)')
+  if (!lane.live) return sec
+  const rowCss = 'display:flex;align-items:center;gap:6px;margin:0 0 8px;font-size:11px;color:var(--dim)'
+  const inCss = 'flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 4px;font-size:11px'
+
+  const row = document.createElement('label')
+  row.style.cssText = rowCss
+  row.append('Plugin')
+  const sel = document.createElement('select')
+  sel.style.cssText = inCss
+  const none = document.createElement('option')
+  none.value = ''
+  none.textContent = '— choose a .vst3 —'
+  sel.appendChild(none)
+  let saved = ''
+  try {
+    saved = localStorage.getItem(VST_PLUGIN_KEY) ?? ''
+  } catch {
+    /* storage unavailable */
+  }
+  void window.daw.vstScan().then((list) => {
+    for (const p of list) {
+      const o = document.createElement('option')
+      o.value = p.path
+      o.textContent = p.name
+      sel.appendChild(o)
+    }
+    sel.value = list.some((p) => p.path === saved) ? saved : ''
+  })
+  sel.addEventListener('change', () => {
+    try {
+      localStorage.setItem(VST_PLUGIN_KEY, sel.value)
+    } catch {
+      /* storage unavailable */
+    }
+  })
+  row.appendChild(sel)
+  sec.appendChild(row)
+
+  const btns = document.createElement('div')
+  btns.style.cssText = 'display:flex;gap:6px;margin:0 0 8px'
+  const listen = document.createElement('button')
+  listen.className = 'sat-mode'
+  listen.style.cssText = 'flex:1'
+  listen.textContent = 'Listen for host'
+  const stop = document.createElement('button')
+  stop.className = 'sat-mode'
+  stop.style.cssText = 'flex:1'
+  stop.textContent = 'Stop'
+  btns.append(listen, stop)
+  sec.appendChild(btns)
+
+  const state = document.createElement('div')
+  state.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:11px;margin:0 0 6px'
+  const dot = document.createElement('span')
+  dot.style.cssText = 'width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none'
+  const stateText = document.createElement('span')
+  stateText.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'
+  state.append(dot, stateText)
+  sec.appendChild(state)
+
+  const args = document.createElement('div')
+  args.style.cssText = 'font-size:10px;color:var(--dim);line-height:1.5;font-family:monospace;word-break:break-all;user-select:text;margin:0 0 6px'
+  sec.appendChild(args)
+  const stats = document.createElement('div')
+  stats.style.cssText = 'font-size:10px;color:var(--dim);line-height:1.5;font-family:monospace;white-space:pre-wrap'
+  sec.appendChild(stats)
+
+  let hostArgs = ''
+  let lastErr = ''
+  listen.addEventListener('click', () => {
+    lastErr = ''
+    if (!sel.value) {
+      lastErr = 'choose a plugin first'
+      return
+    }
+    void window.daw
+      .vstListen(sel.value)
+      .then((r) => {
+        hostArgs = `${r.port} ${r.token}`
+        void window.daw.liveEnable(true) // the live path must be on to receive the host's blocks
+      })
+      .catch((err) => (lastErr = err instanceof Error ? err.message : String(err)))
+  })
+  stop.addEventListener('click', () => {
+    hostArgs = ''
+    lastErr = ''
+    void window.daw.vstStop()
+  })
+
+  const COLOR = { off: 'var(--dim)', wait: 'var(--warn)', ready: 'var(--play)', bad: 'var(--rec)' }
+  const refresh = async (): Promise<void> => {
+    if (!sec.isConnected) return
+    try {
+      const s = (await window.daw.vstStatus()) as {
+        listening: boolean
+        connected: boolean
+        ready: boolean
+        message: string
+        blocks: number
+        rttMeanMs: number
+        rttMaxMs: number
+        budgetMs: number
+        overBudgetBlocks: number
+        resyncs: number
+        eventsSent: number
+        eventsLate: number
+      }
+      const name = (s.message || '').replace(/\s*\(.*$/, '').split(/[\\/]/).pop() ?? ''
+      let c = COLOR.off
+      let t = 'off'
+      if (s.ready) {
+        c = COLOR.ready
+        t = `ready · ${name}`
+      } else if (s.connected) {
+        c = COLOR.wait
+        t = 'host connected, loading the plugin…'
+      } else if (s.listening) {
+        c = COLOR.wait
+        t = 'waiting for the host'
+      } else if (lastErr || (s.message && !/^host disconnected/.test(s.message))) {
+        c = COLOR.bad
+        t = lastErr || s.message
+      }
+      dot.style.background = c
+      stateText.textContent = t
+      stateText.title = t
+      args.textContent = s.listening && !s.ready && hostArgs ? `start the host with:  ${hostArgs}` : ''
+      stats.textContent = s.ready
+        ? `host round trip ${s.rttMeanMs.toFixed(2)} ms (max ${s.rttMaxMs.toFixed(1)}) / budget ${s.budgetMs.toFixed(1)} ms\n` +
+          `blocks ${s.blocks} · over budget ${s.overBudgetBlocks} · resyncs ${s.resyncs}\n` +
+          `midi events ${s.eventsSent} (late ${s.eventsLate})`
+        : ''
+    } catch {
+      /* bridge not available */
+    }
+    window.setTimeout(() => void refresh(), 500)
+  }
+  window.setTimeout(() => void refresh(), 50)
   return sec
 }
 
@@ -3137,7 +3451,11 @@ function renderDetail(): void {
     trackDetailEl.appendChild(buildSynthSection(lane))
     trackDetailEl.appendChild(buildMidiIoSection(lane))
   }
-  if (lane.live) trackDetailEl.appendChild(buildLiveSection(lane))
+  if (lane.live) {
+    trackDetailEl.appendChild(buildLiveSection(lane))
+    trackDetailEl.appendChild(buildReturnSection(lane))
+    trackDetailEl.appendChild(buildVstSection(lane))
+  }
 
   const sp = lane.dsp.params
 
@@ -3753,8 +4071,14 @@ async function boot(): Promise<void> {
   try {
     const gpu = await initGpu()
     const label = `WebGPU ready · ${gpu.adapter.info?.vendor || 'adapter'} ${gpu.adapter.info?.architecture ?? ''}`.trim()
-    setGpuLamp('ok', label)
-    console.log(`[gpu] ${label}`)
+    const soft = isSoftwareAdapter(gpu.adapter.info as AdapterInfoLike | undefined, (gpu.adapter as { isFallbackAdapter?: boolean }).isFallbackAdapter === true)
+    if (soft) {
+      setGpuLamp('off', `${label} — software rendering (no GPU in use): it works, but slowly`)
+      console.warn(`[gpu] ${label} — software rendering (no GPU in use)`)
+    } else {
+      setGpuLamp('ok', label)
+      console.log(`[gpu] ${label}`)
+    }
   } catch (err) {
     const msg = `WebGPU failed: ${(err as Error).message}`
     gpuStatus.textContent = msg
@@ -3772,6 +4096,7 @@ async function boot(): Promise<void> {
   schedulerRef = scheduler
   liveBusRef = scheduler.liveBus = new LiveBus(liveLanes, () => scheduler.masterBus.masterGain)
   liveBusRef.latencyMs = readNum(LIVE_LAT_KEY, 0)
+  setLiveBlock(readNum(LIVE_BLOCK_KEY, LIVE_BLOCK))
   scheduler.recOffsetMs = readNum(REC_OFF_KEY, 0)
   window.daw.onLiveIn((c) => liveBusRef?.feed(c, state.sampleRate))
   masterBusInserts = scheduler.masterBus.inserts // detail pane + strip rack edit this list
@@ -5285,12 +5610,38 @@ async function boot(): Promise<void> {
     trackLevels: (req) => trackLevels(req),
     mixdownExport: (req) => exportMixdown(req),
     groupOutputPeaks: () => groupOutputPeaks(),
+    midiTrackSet: (laneId, patch) => {
+      const lane = laneById(laneId)
+      const mt = lane?.inst ? midiTrackById(lane.inst.midiTrackId) : undefined
+      if (!lane || !mt) throw new Error(`track ${laneId} is not an instrument track`)
+      const ports = midiIo.outputs()
+      if (patch.out !== undefined) {
+        if (/^(none|off|)$/i.test(patch.out.trim())) mt.outId = null
+        else {
+          const want = patch.out.trim().toLowerCase()
+          const p = ports.find((x) => x.name.toLowerCase() === want) ?? ports.find((x) => x.name.toLowerCase().includes(want))
+          if (!p) throw new Error(`no MIDI output port matching "${patch.out}" (ports: ${ports.map((x) => x.name).join(', ') || 'none'})`)
+          mt.outId = p.id
+        }
+      }
+      if (patch.channel !== undefined) mt.channel = Math.max(1, Math.min(16, Math.round(patch.channel))) - 1
+      if (patch.outDelayMs !== undefined) midiIo.setOutDelay(patch.outDelayMs)
+      if (selectedId === lane.id) renderDetail()
+      return {
+        track: laneId,
+        out: ports.find((x) => x.id === mt.outId)?.name ?? null,
+        channel: mt.channel + 1,
+        outDelayMs: midiIo.outDelayMs,
+        ports: ports.map((x) => x.name)
+      }
+    },
     addInstrumentTrack: (name, notes, bpm, kind) => {
       if (bpm && bpm > 0) update({ bpm })
       const mt = addMidiTrack(name)
       if (kind === 'drums') mt.instrument = { kind: 'drums', params: defaultDrumParams() }
       else if (kind === 'earlysynth') mt.instrument = { kind: 'earlysynth', params: earlyPreset('Pop Pluck') ?? {} }
       else if (kind === 'fm') mt.instrument = { kind: 'fm', params: fmPreset('Pop Pluck') ?? {} }
+      else if (kind === 'none') mt.instrument = { kind: 'none', params: {} }
       const end = notes.reduce((m, n) => Math.max(m, n.start + n.dur), 4)
       const clip = addMidiClip(mt, 0, Math.ceil(end), name)
       for (const n of notes) addNote(clip, n.start, n.dur, n.key, n.vel ?? 100)
@@ -5739,7 +6090,8 @@ async function boot(): Promise<void> {
       const lane = lanes[li]
       // the real channel output: after the strip, the inserts, the fader and the pan (measured on the GPU,
       // for the block being played; mute / solo are already in it)
-      const post = state.playing ? mtr.trackPeaks[li] || 0 : 0
+      // a line-input lane is metered by the live bus (its own block path), playing or not
+      const post = lane.live ? (liveBusRef?.peakOf(lane.id) ?? 0) : state.playing ? mtr.trackPeaks[li] || 0 : 0
       lane.vu += (post - lane.vu) * (post > lane.vu ? 0.55 : 0.09) // fast attack, slow release
       if (post > lane.peakHold) lane.peakHold = post
 
@@ -5787,13 +6139,15 @@ async function boot(): Promise<void> {
 
     const m = mtr
 
-    // ---- master strip meter (peak of the readback block, post master-gain) ----
-    masterVu += (m.masterPeak - masterVu) * (m.masterPeak > masterVu ? 0.55 : 0.09)
-    if (m.masterPeak > masterPeakHold) masterPeakHold = m.masterPeak
+    // ---- master strip meter (peak of the readback block, post master-gain; the line-input path adds
+    // onto the output after that readback, so its own peak is taken into account too) ----
+    const masterNow = Math.max(m.masterPeak, liveBusRef?.outPeak() ?? 0)
+    masterVu += (masterNow - masterVu) * (masterNow > masterVu ? 0.55 : 0.09)
+    if (masterNow > masterPeakHold) masterPeakHold = masterNow
     const mnorm = Math.max(0, Math.min(1, (linToDb(masterVu) + 54) / 54))
     masterVuEl.style.height = `${(1 - mnorm) * 100}%`
     if (writeText) {
-      const mdb = linToDb(m.masterPeak)
+      const mdb = linToDb(masterNow)
       masterDbEl.textContent = mdb === -Infinity ? '−∞' : mdb.toFixed(1)
       const mpk = linToDb(masterPeakHold)
       masterPeakEl.textContent = mpk === -Infinity ? '−∞' : mpk.toFixed(1)

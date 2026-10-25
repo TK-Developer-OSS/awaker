@@ -117,9 +117,12 @@ export class MasterBus {
   private readonly stripBank = new StripBank()
   private stripFailLogged = false
   private inter: GPUBuffer | null = null // interleaved [L0,R0,...]
-  private staging: GPUBuffer | null = null // MAP_READ target, reused every block
+  /**
+   * MAP_READ readback buffers, borrowed per block and returned once read: a block's mapAsync may still be
+   * pending when the next block is submitted (the live path overlaps them), so one shared buffer would not do.
+   */
+  private stagingPool = new Map<string, { buf: GPUBuffer; pk: GPUBuffer }[]>()
   private peaksBuf: GPUBuffer | null = null // per-track post-fader peaks (u32 bit patterns of f32), cleared every block
-  private peaksStaging: GPUBuffer | null = null
   private peaksCap = 0
   /** Post-fader peak (linear) of each source of the last rendered block, in the order of `sources`. */
   trackPeaks: Float32Array = new Float32Array(0)
@@ -176,7 +179,8 @@ export class MasterBus {
     this.planar?.destroy()
     this.scratch?.destroy()
     this.inter?.destroy()
-    this.staging?.destroy()
+    for (const list of this.stagingPool.values()) for (const s of list) (s.buf.destroy(), s.pk.destroy())
+    this.stagingPool.clear() // borrowed ones return to a fresh pool once read
     this.big?.destroy()
     this.big = null
     this.bigBytes = 0
@@ -199,13 +203,6 @@ export class MasterBus {
       label: 'master.interleaved',
       size: blockFrames * 2 * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
-    })
-    // Reused every block: renderBlock fully awaits its own mapAsync, so only one
-    // is ever in flight — no need to reallocate ~6×/s.
-    this.staging = device.createBuffer({
-      label: 'master.staging',
-      size: blockFrames * 2 * 4,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
     })
     this.interBind = device.createBindGroup({
       layout: pipelines().interleave.getBindGroupLayout(0),
@@ -251,19 +248,34 @@ export class MasterBus {
     if (this.peaksBuf && this.peaksCap >= n) return
     const { device } = getGpu()
     this.peaksBuf?.destroy()
-    this.peaksStaging?.destroy()
     this.peaksCap = Math.max(32, n)
     this.peaksBuf = device.createBuffer({
       label: 'master.trackPeaks',
       size: this.peaksCap * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
     })
-    this.peaksStaging = device.createBuffer({
-      label: 'master.trackPeaksStaging',
-      size: this.peaksCap * 4,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
-    })
     this.mixAddBinds.clear() // they reference the old peaks buffer
+  }
+
+  /** A readback pair (audio block + peaks), from the pool or new. Peak size is rounded up so lane-count changes reuse it. */
+  private takeStaging(audioBytes: number, peakBytes: number): { buf: GPUBuffer; pk: GPUBuffer; key: string } {
+    const pkBytes = Math.max(256, Math.ceil(peakBytes / 256) * 256)
+    const key = `${audioBytes}:${pkBytes}`
+    const free = this.stagingPool.get(key)?.pop()
+    if (free) return { ...free, key }
+    const { device } = getGpu()
+    const usage = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+    return {
+      buf: device.createBuffer({ label: 'master.staging', size: audioBytes, usage }),
+      pk: device.createBuffer({ label: 'master.trackPeaksStaging', size: pkBytes, usage }),
+      key
+    }
+  }
+
+  private giveStaging(s: { buf: GPUBuffer; pk: GPUBuffer; key: string }): void {
+    const list = this.stagingPool.get(s.key) ?? []
+    list.push({ buf: s.buf, pk: s.pk })
+    this.stagingPool.set(s.key, list)
   }
 
   private ensureGroupBuf(nGroups: number, blockFrames: number): GPUBuffer {
@@ -490,20 +502,24 @@ export class MasterBus {
       pass.end()
     }
 
-    enc.copyBufferToBuffer(this.inter!, 0, this.staging!, 0, blockFrames * 2 * 4)
-    enc.copyBufferToBuffer(this.peaksBuf!, 0, this.peaksStaging!, 0, (nSrc + nGrp) * 4)
+    const st = this.takeStaging(blockFrames * 2 * 4, (nSrc + nGrp) * 4)
+    enc.copyBufferToBuffer(this.inter!, 0, st.buf, 0, blockFrames * 2 * 4)
+    enc.copyBufferToBuffer(this.peaksBuf!, 0, st.pk, 0, (nSrc + nGrp) * 4)
     device.queue.submit([enc.finish()])
     this.processed += blockFrames
 
-    await Promise.all([this.staging!.mapAsync(GPUMapMode.READ), this.peaksStaging!.mapAsync(GPUMapMode.READ)])
-    this.out.set(new Float32Array(this.staging!.getMappedRange()))
-    this.staging!.unmap()
-    const pk = new Float32Array(this.peaksStaging!.getMappedRange(0, (nSrc + nGrp) * 4).slice(0))
-    this.peaksStaging!.unmap()
+    // Everything above ran synchronously, in queue order, so another block may be submitted while this
+    // one's readback is pending; its result is a fresh array (not the shared `out`).
+    await Promise.all([st.buf.mapAsync(GPUMapMode.READ), st.pk.mapAsync(GPUMapMode.READ)])
+    const out = new Float32Array(st.buf.getMappedRange().slice(0))
+    st.buf.unmap()
+    const pk = new Float32Array(st.pk.getMappedRange(0, (nSrc + nGrp) * 4).slice(0))
+    st.pk.unmap()
+    this.giveStaging(st)
     // a NaN would sort above every number in the atomic max: show it as a (red) overload, not as silence
     for (let i = 0; i < pk.length; i++) if (!Number.isFinite(pk[i])) pk[i] = 1e6
     this.trackPeaks = pk.subarray(0, nSrc)
     this.groupPeaks = pk.subarray(nSrc)
-    return this.out
+    return out
   }
 }

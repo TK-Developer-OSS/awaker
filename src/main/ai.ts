@@ -141,7 +141,7 @@ const promptModels = new Set<string>() // models that answered "does not support
 let privateMcp: { url: string; token: string; close(): void } | null = null
 
 // Tool calls that are only looking (or chatting): counted in a turn but not written to the file log.
-const NOISY_TOOLS = new Set(['state_get', 'project_get', 'tracks_list', 'chat_history', 'chat_read', 'logs', 'ui_query', 'wait', 'ops_log', 'screenshot', 'audio_devices', 'live_info', 'instrument_presets', 'mix_target', 'skills_list', 'skill_get'])
+const NOISY_TOOLS = new Set(['state_get', 'project_get', 'tracks_list', 'chat_history', 'chat_read', 'logs', 'ui_query', 'wait', 'ops_log', 'screenshot', 'audio_devices', 'audio_inputs', 'return_status', 'live_info', 'instrument_presets', 'mix_target', 'skills_list', 'skill_get'])
 const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}…` : s)
 
 export function initAi(deps: McpDeps): void {

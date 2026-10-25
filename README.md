@@ -33,6 +33,16 @@ the Electron main process.
   Stems… / Mixdown… (24-bit WAV by default, 48 kHz selectable).
 - **Native output.** Playback goes through RtAudio (WASAPI) in the main package, not Web Audio. ASIO is an optional
   add-on file (see below).
+- **External instruments (experimental).** A MIDI track can have no internal sound ("None") and play an outside
+  synth through its MIDI output port (use a virtual MIDI port such as loopMIDI; Electron's Web MIDI does not list
+  the built-in Windows synth). The synth's audio can come back into the app's *live path* (the same GPU channel strip
+  and inserts as a line input) in two ways: a **VST host bridge** — a separate process loads a VST3 instrument and
+  returns blocks over a local socket (the protocol is in `src/main/vst-bridge.ts`; the trial host used a GPL library
+  and is not part of this repository) — and a **return input**, a second WASAPI input (for example a virtual
+  cable's recording side) with drift correction. Only one of the two feeds the live path at a time. Measured: four
+  heavy strips at 1024-frame blocks without dropped blocks, and an external Kontakt piano lined up with the built-in
+  drums and bass using a −35 ms MIDI out delay. Limits: live-path audio goes to the master only and is not in bounces,
+  mixdowns or stems yet; the return input has not been tried with a real virtual cable.
 
 ## Requirements
 
@@ -92,6 +102,8 @@ Architecture, design invariants, known pitfalls and the development log are in
 
 - **TK** — project owner; steers the design and the real-hardware work. [@TK_Developer](https://x.com/TK_Developer)
 - **Anthropic Claude** — wrote most of the code, working through Claude Code.
+- **Google Gemini** — implemented the return input (`src/main/return-in.ts`), supervised by Claude, working through
+  [Incline](https://github.com/TK-Developer-OSS/incline).
 
 ## License
 

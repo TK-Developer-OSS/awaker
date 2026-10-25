@@ -8,6 +8,8 @@ import { join, dirname, basename } from 'node:path'
 import { existsSync } from 'node:fs'
 import { NativeAudioOut, type AudioOutConfig } from './audio-out'
 import { startMcpServer, mcpLog, mcpRendererReset } from './mcp'
+import { VstBridge, type MidiEv } from './vst-bridge'
+import { ReturnIn, type ReturnInStartConfig } from './return-in'
 import { initAi } from './ai'
 import { buildZip, listZip, readZipEntry, safeBaseName, type ZipInput } from './zip'
 import { parseWavInfo } from './wavinfo'
@@ -36,6 +38,75 @@ app.commandLine.appendSwitch('disable-background-timer-throttling')
 app.setName('awaker')
 
 const audioOut = new NativeAudioOut()
+// External sources (the VST host bridge, the return input) feed the live path through one door: the live ring
+// expects a single contiguous stream, so only the source that started first is let through. A second one is
+// ignored (with a warning) until the first stops.
+let extOwner: string | null = null
+const extSource = (who: string): { inject: (f: Float32Array, start: number) => void; setExternal: (on: boolean) => void } => ({
+  inject: (f, start) => {
+    if (extOwner === who) audioOut.injectLive(f, start)
+  },
+  setExternal: (on) => {
+    if (on) {
+      if (extOwner === null) {
+        extOwner = who
+        audioOut.setExternalLive(true)
+      } else if (extOwner !== who) {
+        console.warn(`[external-live] "${who}" started while "${extOwner}" feeds the live path: its audio is ignored until "${extOwner}" stops`)
+      }
+    } else if (extOwner === who) {
+      extOwner = null
+      audioOut.setExternalLive(false)
+    }
+  }
+})
+const vstSource = extSource('vst')
+const returnSource = extSource('return')
+// VST host bridge (proof of concept): an out-of-process instrument host feeding the live path.
+const vstBridge = new VstBridge({
+  clock: () => audioOut.outClock,
+  running: () => audioOut.isRunning,
+  rate: () => audioOut.rate,
+  inject: vstSource.inject,
+  setExternal: vstSource.setExternal
+})
+const returnIn = new ReturnIn({
+  clock: () => audioOut.smoothOutClock,
+  running: () => audioOut.isRunning,
+  rate: () => audioOut.rate,
+  inject: returnSource.inject,
+  setExternal: returnSource.setExternal,
+  setAlignProbe: (on) => audioOut.setAlignProbe(on),
+  openWasapiInput: (deviceId, deviceName, sampleRate, blockFrames, onData, onError) =>
+    audioOut.openWasapiInput(deviceId, deviceName, sampleRate, blockFrames, onData, onError)
+})
+ipcMain.handle('daw:return:status', () => returnIn.status())
+ipcMain.handle('daw:return:start', (_e, cfg: ReturnInStartConfig) => returnIn.start(cfg ?? {}))
+ipcMain.handle('daw:return:stop', () => returnIn.stop())
+ipcMain.handle('daw:return:delay', (_e, ms: number) => returnIn.setDelayMs(Number(ms) || 0))
+ipcMain.handle('daw:vst:status', () => vstBridge.status())
+ipcMain.handle('daw:vst:listen', (_e, plugin: string) => {
+  if (typeof plugin !== 'string' || !/\.vst3$/i.test(plugin) || !existsSync(plugin)) throw new Error('not a .vst3 plugin')
+  return vstBridge.listen(plugin)
+})
+ipcMain.handle('daw:vst:stop', () => vstBridge.stop())
+/** The VST3 plugins in the standard folders (one level), for the picker. */
+ipcMain.handle('daw:vst:scan', async () => {
+  const out: { name: string; path: string }[] = []
+  for (const dir of new Set([process.env['CommonProgramFiles'], process.env['CommonProgramFiles(x86)']])) {
+    if (!dir) continue
+    const root = join(dir, 'VST3')
+    try {
+      for (const n of await readdir(root)) if (/\.vst3$/i.test(n)) out.push({ name: n.replace(/\.vst3$/i, ''), path: join(root, n) })
+    } catch {
+      /* folder missing */
+    }
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name))
+})
+ipcMain.on('daw:vst:midi', (_e, evs: MidiEv[]) => {
+  if (Array.isArray(evs)) vstBridge.midi(evs.slice(0, 512).map((e) => ({ t: +e.t, st: e.st | 0, d1: e.d1 | 0, d2: e.d2 | 0 })))
+})
 let statusTimer: NodeJS.Timeout | null = null
 let mainWin: BrowserWindow | null = null
 
@@ -544,6 +615,7 @@ ipcMain.handle('daw:options:save', async (_e, data: unknown) => {
 })
 
 ipcMain.handle('daw:audio:devices', () => audioOut.listDevices())
+ipcMain.handle('daw:audio:inputs', () => audioOut.listInputDevices())
 
 ipcMain.handle('daw:audio:start', (e, cfg: AudioOutConfig) => {
   const status = audioOut.start(cfg)
@@ -728,11 +800,19 @@ app.whenReady().then(() => {
   createWindow()
   // AI connection (OpenAI-compatible backend; the Claude Code backend needs nothing here). Always registered:
   // it does nothing until the person picks that backend in the AI panel.
-  initAi({ getWin: () => mainWin, listDevices: () => audioOut.listDevices() })
+  initAi({
+    getWin: () => mainWin,
+    listDevices: () => audioOut.listDevices(),
+    listInputs: () => audioOut.listInputDevices(),
+    returnIn
+  })
   if (process.env['DAW_MCP']) {
     startMcpServer(Number(process.env['DAW_MCP_PORT']) || 7777, {
       getWin: () => mainWin,
-      listDevices: () => audioOut.listDevices()
+      listDevices: () => audioOut.listDevices(),
+      listInputs: () => audioOut.listInputDevices(),
+      vst: vstBridge,
+      returnIn
     })
   }
   app.on('activate', () => {
@@ -741,6 +821,8 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  returnIn.stop()
+  vstBridge.stop()
   audioOut.stop()
   if (process.platform !== 'darwin') app.quit()
 })
