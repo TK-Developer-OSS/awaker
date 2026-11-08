@@ -14,7 +14,7 @@ the Electron main process.
   sample-rate conversion and waveform peaks all run as WebGPU compute. The CPU only
   schedules blocks and does device I/O. DSP that is expensive on a CPU is cheap here:
   an early measurement (RTX 3060 Ti, 8 GB) played 24 tracks at 96 kHz at ~7 % GPU
-  load. VRAM capacity, not compute, is the practical limit today (see DEVELOP.md).
+  load. VRAM capacity, not compute, is the practical limit today.
 - **Built for AI from the start.** An opt-in, localhost-only MCP server
   (`npm run dev:mcp`) lets an AI drive the running app: edit the project, move faders
   and plugin parameters, control transport and recording, render an offline bounce and
@@ -125,11 +125,6 @@ npm run package    # portable Windows build + zip in dist/
 
 Note: `npm run dev` / `preview` go through `scripts/run.mjs`, which clears
 `ELECTRON_RUN_AS_NODE` (set by some terminals) before launching Electron.
-
-## Documentation
-
-Architecture, design invariants, known pitfalls and the development log are in
-[DEVELOP.md](DEVELOP.md) (Japanese).
 
 ## Authors
 

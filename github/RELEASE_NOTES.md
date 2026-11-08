@@ -49,7 +49,7 @@ repository contains no code from Steinberg's ASIO SDK (see NOTICE). The add-on i
 ## Known limits
 
 - Windows only. The icon is a temporary one.
-- VRAM capacity, not compute, is the practical limit (see DEVELOP.md).
+- VRAM capacity, not compute, is the practical limit.
 - Phase and stereo width are not measured by the AI mix.
 
 ## Licence and credits
