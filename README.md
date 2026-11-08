@@ -54,6 +54,28 @@ the Electron main process.
   heavy strips at 1024-frame blocks without dropped blocks, and an external Kontakt piano lined up with the built-in
   drums and bass using a −35 ms MIDI out delay. Limits: live-path audio goes to the master only and is not in bounces,
   mixdowns or stems yet; the return input has not been tried with a real virtual cable.
+- **Awaker Mixer: a virtual audio bus for standalone instruments (experimental).** A separate, optional driver
+  (`awaker-mixer/`, its own repository, GPL-3.0) that a standalone instrument picks as its ASIO driver: it offers 48
+  outputs and copies every block into shared memory, where Awaker reads it (Awaker itself contains none of the
+  driver's code, only a reader of the documented format). The return input takes several consecutive stereo pairs at
+  once (`return_start {mixerPair, mixerPairs}` over MCP), and each pair becomes its own line-input track with its own
+  channel strip — a multi-timbral instrument comes in as separate parts, with no audio-interface loopback and no
+  virtual cable. Tried with HALion Sonic (standalone): drums, bass, two pianos, a saw lead and an EWI sound on six
+  pairs. Limits: the driver still runs on its own clock (the return absorbs up to 5000 ppm of drift; making Awaker the
+  clock master is next), the bus is read from the main thread, and six live tracks want a 2048-frame live block.
+  Register the driver once from an elevated prompt (`regsvr32 awaker-mixer.dll`).
+- **Groove humanizer.** Per MIDI track (detail pane → MIDI I/O → *Humanize*): *Rock Dr 8-Bt* (for drum tracks) keeps the kick on 1 on the grid
+  and pushes the 8th off-beats and the snare on 4 slightly early (−2 ms, 1–3 ms with the strength control); the first two onsets of each tom fill lean ahead too; on drum
+  tracks that snare is also played about 10 % softer, with a fixed per-note random so every bar differs a little. The stored notes stay on the grid — MIDI out and the built-in instrument render read the shifted time — and
+  the offsets are in milliseconds, so the feel holds at any tempo. Saved with the project; MCP
+  `midi_track_set {humanize}`.
+- **Debug monitor and session log.** Every start writes a log file (`%APPDATA%awakerlogsawaker-<date>-<time>.log`,
+  the last 20 kept) with what the main process prints and the window's warnings / errors. *View → Debug Monitor*
+  (Ctrl+Shift+D, or `DAW_DEBUG=1`) adds a stats line per second — output buffer and underruns, live path (late /
+  dropped blocks, round trip, processing time), return input (ring fill, drift ppm, over / underruns, resyncs), load —
+  and an *EVENT* line whenever a dropout counter goes up, and shows the same in a small window.
+- **Load gauge.** The top bar shows *CPU* (the app's processes), *GPU* (mix render time ÷ audio time) and *Live*
+  (share of time the live path is busy); amber from 75 %, red from 100 % (cannot keep up → dropouts).
 
 ## Requirements
 

@@ -614,6 +614,97 @@ napi_value fnCompiledApis(napi_env env, napi_callback_info) {
   return arr;
 }
 
+// ---- Awaker Mixer reader --------------------------------------------------------------------------------
+// Reads the virtual bus that the Awaker Mixer driver (a separate program, awaker-mixer/) writes into shared
+// memory. Implemented from the documented format only (header offsets below + a ring of planar float32);
+// none of the driver's code is used here.
+
+struct MixerView {
+  HANDLE map = nullptr;
+  const uint8_t *base = nullptr;
+} mixer;
+
+constexpr size_t MX_SAMPLE_RATE = 24, MX_BLOCK = 28, MX_RUNNING = 32, MX_ACTIVE = 40, MX_WRITE = 48, MX_CLIENT = 64;
+
+uint32_t mxU32(size_t off) { return *reinterpret_cast<const volatile uint32_t *>(mixer.base + off); }
+int64_t mxI64(size_t off) { return *reinterpret_cast<const volatile int64_t *>(mixer.base + off); }
+
+void mixerClose() {
+  if (mixer.base) UnmapViewOfFile(mixer.base);
+  if (mixer.map) CloseHandle(mixer.map);
+  mixer = MixerView{};
+}
+
+bool mixerOpen() {
+  if (mixer.base) return true;
+  mixer.map = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Local\\AwakerMixer.v1");
+  if (!mixer.map) return false;
+  mixer.base = static_cast<const uint8_t *>(MapViewOfFile(mixer.map, FILE_MAP_READ, 0, 0, 0));
+  if (!mixer.base || std::memcmp(mixer.base, "AWKMIX1", 8) != 0 || mxU32(8) != 1) {
+    mixerClose();
+    return false;
+  }
+  return true;
+}
+
+napi_value fnMixerInfo(napi_env env, napi_callback_info) {
+  napi_value o = nullptr;
+  N.napi_create_object(env, &o);
+  const bool open = mixerOpen();
+  setProp(env, o, "open", boolean(env, open));
+  if (!open) return o;
+  const uint64_t mask = *reinterpret_cast<const volatile uint64_t *>(mixer.base + MX_ACTIVE);
+  char client[65] = {0};
+  std::memcpy(client, mixer.base + MX_CLIENT, 64);
+  setProp(env, o, "channels", num(env, mxU32(16)));
+  setProp(env, o, "ringFrames", num(env, mxU32(20)));
+  setProp(env, o, "sampleRate", num(env, mxU32(MX_SAMPLE_RATE)));
+  setProp(env, o, "blockFrames", num(env, mxU32(MX_BLOCK)));
+  setProp(env, o, "running", boolean(env, mxU32(MX_RUNNING) != 0));
+  setProp(env, o, "activeLo", num(env, static_cast<double>(mask & 0xffffffffu)));
+  setProp(env, o, "activeHi", num(env, static_cast<double>(mask >> 32)));
+  setProp(env, o, "writeFrames", num(env, static_cast<double>(mxI64(MX_WRITE))));
+  setProp(env, o, "client", text(env, client));
+  return o;
+}
+
+// mixerRead(from, firstChannel, channels) → { to, data } : interleaved float32 frames [from, to) of
+// channels [firstChannel, firstChannel + channels). `to` is the driver's write position; when `from` is
+// too old (overwritten) the read starts at the oldest frame still in the ring.
+napi_value fnMixerRead(napi_env env, napi_callback_info info) {
+  Args a(env, info);
+  napi_value o = nullptr;
+  N.napi_create_object(env, &o);
+  if (!mixerOpen()) return o;
+  const uint32_t chans = mxU32(16), ring = mxU32(20), headerBytes = mxU32(12);
+  const int64_t to = mxI64(MX_WRITE);
+  MemoryBarrier(); // samples are written before the position
+  int64_t from = static_cast<int64_t>(a.num(0, static_cast<double>(to)));
+  const uint32_t c0 = static_cast<uint32_t>(a.num(1, 0));
+  const uint32_t nc = static_cast<uint32_t>(a.num(2, 2));
+  if (from > to) from = to;
+  if (to - from > static_cast<int64_t>(ring) - 4096) from = to - (ring - 4096); // keep clear of the writer
+  if (c0 + nc > chans || nc == 0 || ring == 0) return o;
+  const size_t frames = static_cast<size_t>(to - from);
+  std::vector<float> out(frames * nc);
+  const float *s = reinterpret_cast<const float *>(mixer.base + headerBytes);
+  for (size_t i = 0; i < frames; i++) {
+    const size_t pos = static_cast<size_t>((from + static_cast<int64_t>(i)) & (ring - 1));
+    for (uint32_t c = 0; c < nc; c++) out[i * nc + c] = s[static_cast<size_t>(c0 + c) * ring + pos];
+  }
+  napi_value buf = nullptr;
+  N.napi_create_buffer_copy(env, out.size() * sizeof(float), out.data(), nullptr, &buf);
+  setProp(env, o, "from", num(env, static_cast<double>(from)));
+  setProp(env, o, "to", num(env, static_cast<double>(to)));
+  setProp(env, o, "data", buf);
+  return o;
+}
+
+napi_value fnMixerClose(napi_env env, napi_callback_info) {
+  mixerClose();
+  return undef(env);
+}
+
 void define(napi_env env, napi_value exports, const char *name, napi_callback cb) {
   napi_value f = nullptr;
   N.napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &f);
@@ -653,6 +744,9 @@ __declspec(dllexport) napi_value napi_register_module_v1(napi_env env, napi_valu
   define(env, exports, "setInputCallback", fnSetInputCallback);
   define(env, exports, "setFrameOutputCallback", fnSetFrameOutputCallback);
   define(env, exports, "compiledApis", fnCompiledApis);
+  define(env, exports, "mixerInfo", fnMixerInfo);
+  define(env, exports, "mixerRead", fnMixerRead);
+  define(env, exports, "mixerClose", fnMixerClose);
   return exports;
 }
 

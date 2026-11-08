@@ -45,6 +45,8 @@ export class MidiIo {
   recording = false
   /** Extra delay (ms) applied to MIDI output, to match the audio device latency. */
   outDelayMs = 0
+  /** Latest timestamp handed to a port (performance.now() ms): queued events may still be ahead of it. */
+  private lastTs = 0
 
   constructor() {
     try {
@@ -122,7 +124,7 @@ export class MidiIo {
       this.lastEnd = ph
     }
     const bpm = state.bpm
-    const events = planWindow(midiTracks, audible, this.lastEnd, horizon, (b) => beatsToFrames(b, bpm, sr))
+    const events = planWindow(midiTracks, audible, this.lastEnd, horizon, (b) => beatsToFrames(b, bpm, sr), sr / 1000)
     this.lastEnd = horizon
     if (!events.length) return
     const nowMs = performance.now()
@@ -131,10 +133,13 @@ export class MidiIo {
       const port = t?.outId ? this.access.outputs.get(t.outId) : undefined
       if (!t || !port) continue
       const ts = nowMs + ((e.frame - ph) / sr) * 1000 + this.outDelayMs
+      if (ts > this.lastTs) this.lastTs = ts
       const ch = t.channel & 0x0f
       const id = `${t.outId}|${ch}|${e.key}`
       try {
         if (e.kind === 'on') {
+          // the same key still on (overlapping notes): end it first, or the synth stacks two voices and one never stops
+          if (this.active.has(id)) port.send([0x80 | ch, e.key, 0], ts)
           port.send([0x90 | ch, e.key, e.vel], ts)
           this.active.set(id, { outId: t.outId as string, ch, key: e.key })
         } else {
@@ -147,26 +152,52 @@ export class MidiIo {
     }
   }
 
-  /** Release everything that is sounding (stop, seek, hot-unplug). */
+  /**
+   * Release everything that is sounding (stop, seek, hot-unplug). Note-ons already handed to the port with a
+   * future timestamp (the look-ahead window) still arrive after an immediate release and would hang (their
+   * note-offs are never sent once playback jumped), so the release is sent again just after the last one.
+   */
   allOff(): void {
     if (!this.access) return
     const chans = new Set<string>()
-    for (const a of this.active.values()) {
-      try {
-        this.access.outputs.get(a.outId)?.send([0x80 | a.ch, a.key, 0])
-      } catch {
-        /* port vanished */
+    const held = [...this.active.values()]
+    for (const a of held) chans.add(`${a.outId}|${a.ch}`)
+    // every channel a track sends to, not only the notes we know are held (a synth may keep others)
+    for (const t of midiTracks) if (t.outId) chans.add(`${t.outId}|${t.channel & 0x0f}`)
+    const release = (ts?: number): void => {
+      for (const a of held) {
+        try {
+          this.access?.outputs.get(a.outId)?.send([0x80 | a.ch, a.key, 0], ts)
+        } catch {
+          /* port vanished */
+        }
       }
-      chans.add(`${a.outId}|${a.ch}`)
-    }
-    for (const c of chans) {
-      const [outId, ch] = c.split('|')
-      try {
-        this.access.outputs.get(outId)?.send([0xb0 | Number(ch), 123, 0]) // all notes off
-      } catch {
-        /* port vanished */
+      for (const c of chans) {
+        const [outId, ch] = c.split('|')
+        try {
+          const out = this.access?.outputs.get(outId)
+          const c = 0xb0 | Number(ch)
+          out?.send([c, 64, 0], ts) // sustain off
+          out?.send([c, 120, 0], ts) // all sound off
+          out?.send([c, 123, 0], ts) // all notes off
+        } catch {
+          /* port vanished */
+        }
       }
     }
+    for (const outId of new Set([...chans].map((c) => c.split('|')[0]))) {
+      const port = this.access.outputs.get(outId) as (MIDIOutput & { clear?: () => void }) | undefined
+      try {
+        port?.clear?.() // drop what is still queued, where the browser supports it
+      } catch {
+        /* not implemented */
+      }
+    }
+    console.log(`[midi] all off: ${held.length} held, channels ${[...chans].map((c) => Number(c.split('|')[1]) + 1).join(',')}, queued until +${Math.max(0, this.lastTs - performance.now()).toFixed(0)} ms`)
+    release()
+    const now = performance.now()
+    if (this.lastTs > now) release(this.lastTs + 2)
+    this.lastTs = 0
     this.active.clear()
   }
 

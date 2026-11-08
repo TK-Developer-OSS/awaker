@@ -6,10 +6,14 @@ import { app, BrowserWindow, ipcMain, dialog, Menu, session, type MenuItemConstr
 import { readFile, readdir, writeFile, mkdir, rm, rename, open as fsOpen, stat } from 'node:fs/promises'
 import { join, dirname, basename } from 'node:path'
 import { existsSync } from 'node:fs'
+import os from 'node:os'
 import { NativeAudioOut, type AudioOutConfig } from './audio-out'
+import { loadAudioModule } from './audio-module'
+import { DebugLog, DROPOUT_COUNTERS, pick } from './debug-log'
+import { initProjectDoc, projectDocPath, projectDocTitle, restoreProjectDoc, setProjectDoc } from './project-doc'
 import { startMcpServer, mcpLog, mcpRendererReset } from './mcp'
 import { VstBridge, type MidiEv } from './vst-bridge'
-import { ReturnIn, type ReturnInStartConfig } from './return-in'
+import { ReturnIn, type MixerBus, type ReturnInStartConfig } from './return-in'
 import { initAi } from './ai'
 import { buildZip, listZip, readZipEntry, safeBaseName, type ZipInput } from './zip'
 import { parseWavInfo } from './wavinfo'
@@ -42,9 +46,9 @@ const audioOut = new NativeAudioOut()
 // expects a single contiguous stream, so only the source that started first is let through. A second one is
 // ignored (with a warning) until the first stops.
 let extOwner: string | null = null
-const extSource = (who: string): { inject: (f: Float32Array, start: number) => void; setExternal: (on: boolean) => void } => ({
-  inject: (f, start) => {
-    if (extOwner === who) audioOut.injectLive(f, start)
+const extSource = (who: string): { inject: (f: Float32Array, start: number, channels?: number) => void; setExternal: (on: boolean) => void } => ({
+  inject: (f, start, channels = 2) => {
+    if (extOwner === who) audioOut.injectLive(f, start, channels)
   },
   setExternal: (on) => {
     if (on) {
@@ -78,9 +82,23 @@ const returnIn = new ReturnIn({
   setExternal: returnSource.setExternal,
   setAlignProbe: (on) => audioOut.setAlignProbe(on),
   openWasapiInput: (deviceId, deviceName, sampleRate, blockFrames, onData, onError) =>
-    audioOut.openWasapiInput(deviceId, deviceName, sampleRate, blockFrames, onData, onError)
+    audioOut.openWasapiInput(deviceId, deviceName, sampleRate, blockFrames, onData, onError),
+  get mixer() {
+    return (loadAudioModule() as unknown as { mixer?: MixerBus | null }).mixer ?? undefined
+  }
 })
 ipcMain.handle('daw:return:status', () => returnIn.status())
+// CPU of the app's processes (% of one core, summed per type) for the load gauge
+ipcMain.handle('daw:metrics:cpu', () => {
+  const by: Record<string, number> = {}
+  let total = 0
+  for (const m of app.getAppMetrics()) {
+    const p = m.cpu.percentCPUUsage
+    by[m.type] = (by[m.type] ?? 0) + p
+    total += p
+  }
+  return { total, byType: by, cores: os.cpus().length }
+})
 ipcMain.handle('daw:return:start', (_e, cfg: ReturnInStartConfig) => returnIn.start(cfg ?? {}))
 ipcMain.handle('daw:return:stop', () => returnIn.stop())
 ipcMain.handle('daw:return:delay', (_e, ms: number) => returnIn.setDelayMs(Number(ms) || 0))
@@ -110,6 +128,70 @@ ipcMain.on('daw:vst:midi', (_e, evs: MidiEv[]) => {
 let statusTimer: NodeJS.Timeout | null = null
 let mainWin: BrowserWindow | null = null
 
+// ---- session log file + debug monitor ---------------------------------------------------------------
+// Everything main prints goes to <userData>/logs/awaker-<start>.log too (see debug-log.ts). The debug
+// monitor (View → Debug Monitor, Ctrl+Shift+D, or DAW_DEBUG=1) adds a stats line per second and an EVENT
+// line whenever a dropout counter goes up, and shows the same in the window.
+const debugLog = new DebugLog(join(app.getPath('userData'), 'logs'))
+for (const level of ['log', 'warn', 'error'] as const) {
+  const orig = console[level].bind(console)
+  console[level] = (...args: unknown[]): void => {
+    orig(...args)
+    debugLog.line(level === 'log' ? 'main' : `main:${level}`, args.map((a) => (typeof a === 'string' ? a : a instanceof Error ? a.stack ?? a.message : JSON.stringify(a))).join(' '))
+  }
+}
+let debugOn = !!process.env['DAW_DEBUG']
+let winStats: Record<string, unknown> = {}
+let prevCounters: Record<string, number> = {}
+const recentEvents: string[] = []
+const r1 = (v: number): number => Math.round(v * 10) / 10
+function setDebug(on: boolean): void {
+  debugOn = on
+  prevCounters = {}
+  debugLog.line('debug', on ? `monitor on (log: ${debugLog.file})` : 'monitor off')
+  mainWin?.webContents.send('daw:debug', { on, file: debugLog.file })
+  const item = Menu.getApplicationMenu()?.getMenuItemById('debug-monitor')
+  if (item) item.checked = on // also when switched from the window
+}
+setInterval(() => {
+  if (!debugOn) return
+  const out = audioOut.status()
+  const ret = returnIn.status()
+  const sr = out.sampleRate || 96000
+  const snap = { out, ret, win: winStats }
+  const ev: string[] = []
+  for (const k of DROPOUT_COUNTERS) {
+    const v = pick(snap, k)
+    const was = prevCounters[k]
+    if (was !== undefined && v > was) ev.push(`${k} +${v - was}`)
+    prevCounters[k] = v
+  }
+  const line =
+    `out ${out.backend} buf ${r1((out.bufferedFrames / sr) * 1000)}ms under ${out.underrunFrames}` +
+    ` | live ${out.live.enabled ? 'on' : 'off'} late ${out.live.late} far ${out.live.tooFar} rtt ${r1(out.live.rttMeanMs)}/${r1(out.live.rttMaxMs)}ms` +
+    ` | ret ${ret.mode}${ret.mode !== 'off' ? ` ring ${ret.ringBufferedFrames}/${ret.ringTargetFrames} ppm ${ret.ppm} over ${ret.overruns} under ${ret.underruns} resync ${ret.resyncs}` : ''}` +
+    ` | win ${JSON.stringify(winStats)}`
+  debugLog.line('stats', line)
+  for (const e of ev) {
+    debugLog.line('EVENT', e)
+    recentEvents.push(`${new Date().toLocaleTimeString()} ${e}`)
+  }
+  if (recentEvents.length > 200) recentEvents.splice(0, recentEvents.length - 200)
+  mainWin?.webContents.send('daw:debug:snapshot', { out, ret, win: winStats, events: recentEvents.slice(-50), file: debugLog.file })
+}, 1000)
+ipcMain.on('daw:debug:stats', (_e, s: Record<string, unknown>) => {
+  winStats = s ?? {}
+})
+ipcMain.on('daw:debug:event', (_e, text: string) => {
+  debugLog.line('EVENT', String(text))
+  recentEvents.push(`${new Date().toLocaleTimeString()} ${text}`)
+})
+ipcMain.handle('daw:debug:state', () => ({ on: debugOn, file: debugLog.file }))
+ipcMain.handle('daw:debug:set', (_e, on: boolean) => {
+  setDebug(!!on)
+  return { on: debugOn, file: debugLog.file }
+})
+
 /** The app icon (a temporary one): beside the app when packaged, in build/ when running from the repo. */
 function appIconPath(): string | undefined {
   const p = app.isPackaged ? join(process.resourcesPath, 'icon.png') : join(app.getAppPath(), 'build', 'icon.png')
@@ -134,6 +216,12 @@ function createWindow(): void {
   })
 
   mainWin = win
+  // the page's <title> would replace the document name on every load
+  win.on('page-title-updated', (e) => {
+    e.preventDefault()
+    win.setTitle(projectDocTitle())
+  })
+  win.setTitle(projectDocTitle())
   win.on('closed', () => {
     if (mainWin === win) mainWin = null
   })
@@ -163,6 +251,10 @@ function createWindow(): void {
   })
   win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
     mcpLog(level, message) // MCP `logs` tool keeps everything, not just warn/error
+    if (level >= 1) {
+      const where = sourceId ? ` (${sourceId.split('/').pop()}:${line})` : ''
+      debugLog.line(level >= 3 ? 'renderer:error' : level === 2 ? 'renderer:warn' : 'renderer', `${message}${level >= 2 ? where : ''}`)
+    }
     if (level < 2) return // 0 = log, 1 = info/warn-ish; only surface warnings (2) + errors (3)
     const tag = level >= 3 ? '[renderer:error]' : '[renderer:warn]'
     const where = sourceId ? ` (${sourceId.split('/').pop()}:${line})` : ''
@@ -230,6 +322,14 @@ function buildMenu(win: BrowserWindow): void {
         { role: 'reload' },
         { role: 'forceReload' },
         { role: 'toggleDevTools' },
+        {
+          id: 'debug-monitor',
+          label: 'Debug Monitor',
+          type: 'checkbox',
+          checked: debugOn,
+          accelerator: 'CmdOrCtrl+Shift+D',
+          click: (item) => setDebug(item.checked)
+        },
         { type: 'separator' },
         { role: 'resetZoom' },
         { role: 'zoomIn' },
@@ -281,86 +381,43 @@ ipcMain.handle('daw:autoloadWavs', async () => {
 })
 
 // --- IPC: project save / load --------------------------------------------------
-// The canonical project file. `save` writes it; `load` (called on startup)
-// restores it instead of the test-bed autoload. The dialog-based `export` /
-// `import` also refresh the canonical file, so the app always relaunches into
-// whatever project was last touched.
-//
-// Preferred location is the per-user app-data dir; but this dev box has shown
-// access-denied on that path (the Chromium disk-cache errors), so we fall back
-// to a file next to the app if userData isn't writable, and remember which one
-// worked for the rest of the session.
-const PROJECT_BASENAME = 'awaker-project.json'
-// App renamed gpudaw → Awaker (2026-09-07). app.setName('awaker') pins userData
-// to %APPDATA%/awaker; keep the pre-rename %APPDATA%/gpudaw/gpudaw-project.json as
-// a read fallback so an old session still auto-restores. The next Save writes the
-// new path.
-const LEGACY_BASENAME = 'gpudaw-project.json'
+// Project files: the open document (project-doc.ts) is what Save writes and what the next start reopens.
+// With none, the app starts on a blank project. (The old default file, userData/awaker-project.json, is no
+// longer read or written.)
 
-function candidateProjectPaths(): string[] {
-  const paths: string[] = []
-  try {
-    const ud = app.getPath('userData')
-    paths.push(join(ud, PROJECT_BASENAME))
-    paths.push(join(dirname(ud), 'gpudaw', LEGACY_BASENAME)) // pre-rename userData
-  } catch {
-    /* getPath can throw before app is ready / on odd installs */
-  }
-  try {
-    paths.push(join(app.getPath('documents'), 'Awaker', PROJECT_BASENAME))
-    paths.push(join(app.getPath('documents'), 'gpudaw', LEGACY_BASENAME))
-  } catch {
-    /* ignore */
-  }
-  // Last resort: alongside the app (repo root in dev, resources dir when packaged).
-  paths.push(join(app.getAppPath(), PROJECT_BASENAME))
-  paths.push(join(app.getAppPath(), LEGACY_BASENAME))
-  return paths
-}
+/** The first load of a run restores the last open document (later loads are page reloads). */
+let initDocDone = false
 
-/** The path a previous save/load in this session actually used. */
-let resolvedProjectPath: string | null = null
-
-async function writeCanonicalProject(data: unknown): Promise<string> {
-  const json = JSON.stringify(data, null, 2)
-  const tried = resolvedProjectPath ? [resolvedProjectPath] : candidateProjectPaths()
-  let lastErr: unknown
-  for (const p of tried) {
-    try {
-      await mkdir(dirname(p), { recursive: true })
-      await writeFile(p, json, 'utf8')
-      resolvedProjectPath = p
-      return p
-    } catch (err) {
-      lastErr = err
-      console.error('[project] could not write', p, '-', (err as Error)?.message ?? err)
-    }
-  }
-  throw new Error(`no writable location (tried ${tried.length}): ${(lastErr as Error)?.message ?? lastErr}`)
-}
-
-async function readCanonicalProject(): Promise<unknown | null> {
-  for (const p of resolvedProjectPath ? [resolvedProjectPath] : candidateProjectPaths()) {
-    try {
-      const data = JSON.parse(await readFile(p, 'utf8'))
-      resolvedProjectPath = p
-      return data
-    } catch {
-      /* try the next candidate */
-    }
-  }
-  return null // nothing saved yet
-}
+ipcMain.handle('daw:project:new', async () => {
+  await setProjectDoc(null) // no open document: the next Save asks where
+})
 
 ipcMain.handle('daw:project:load', async () => {
-  const data = await readCanonicalProject()
-  console.log('[project] load', resolvedProjectPath ?? '(none)', data ? 'ok' : 'empty')
-  return data
+  if (!initDocDone) {
+    initDocDone = true
+    const doc = await restoreProjectDoc()
+    if (doc) {
+      console.log('[project] load (last document)', doc.path)
+      return doc.data
+    }
+  } else if (projectDocPath()) {
+    try {
+      return JSON.parse(await readFile(projectDocPath() as string, 'utf8'))
+    } catch {
+      /* gone: start blank */
+    }
+  }
+  console.log('[project] start blank (no open document)')
+  return null
 })
 
 ipcMain.handle('daw:project:save', async (_e, data: unknown) => {
+  // nothing opened or saved-as yet: Save asks where, like Save As
+  const doc = projectDocPath()
+  if (!doc) return saveAsDialog(data)
   try {
-    const path = await writeCanonicalProject(data)
+    await writeFile(doc, JSON.stringify(data, null, 2), 'utf8')
+    const path = doc
     console.log('[project] saved', path)
     return { ok: true as const, path }
   } catch (err) {
@@ -369,7 +426,9 @@ ipcMain.handle('daw:project:save', async (_e, data: unknown) => {
   }
 })
 
-ipcMain.handle('daw:project:export', async (_e, data: unknown) => {
+ipcMain.handle('daw:project:export', async (_e, data: unknown) => saveAsDialog(data))
+
+async function saveAsDialog(data: unknown): Promise<{ ok: true; path: string } | { ok: false; error: string } | null> {
   try {
     const res = await dialog.showSaveDialog({
       title: 'Save project',
@@ -378,14 +437,14 @@ ipcMain.handle('daw:project:export', async (_e, data: unknown) => {
     })
     if (res.canceled || !res.filePath) return null
     await writeFile(res.filePath, JSON.stringify(data, null, 2), 'utf8')
-    await writeCanonicalProject(data).catch(() => {}) // best-effort: relaunch restores this one
+    await setProjectDoc(res.filePath) // Save now writes here; the next start reopens it
     console.log('[project] exported', res.filePath)
     return { ok: true as const, path: res.filePath }
   } catch (err) {
     console.error('[project] export failed', err)
     return { ok: false as const, error: String((err as Error)?.message ?? err) }
   }
-})
+}
 
 ipcMain.handle('daw:project:import', async () => {
   const res = await dialog.showOpenDialog({
@@ -396,7 +455,8 @@ ipcMain.handle('daw:project:import', async () => {
   if (res.canceled || res.filePaths.length === 0) return null
   try {
     const data = JSON.parse(await readFile(res.filePaths[0], 'utf8'))
-    await writeCanonicalProject(data).catch(() => {}) // relaunch restores this one
+    await setProjectDoc(res.filePaths[0]) // Save writes back to this file; the next start reopens it
+    console.log('[project] opened', res.filePaths[0])
     return data
   } catch (err) {
     console.error('[project] import failed', err)
@@ -793,6 +853,7 @@ ipcMain.handle('daw:export:writeFile', async (_e, dir: unknown, name: unknown, b
 })
 
 app.whenReady().then(() => {
+  initProjectDoc(app.getPath('userData'), () => mainWin?.setTitle(projectDocTitle()))
   // Web MIDI (control surface, e.g. P1-Nano class). Sysex is needed for its LCD.
   const midiPerms = new Set(['midi', 'midiSysex'])
   session.defaultSession.setPermissionRequestHandler((_wc, perm, cb) => cb(midiPerms.has(perm)))
@@ -819,6 +880,8 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
+
+app.on('will-quit', () => debugLog.close())
 
 app.on('window-all-closed', () => {
   returnIn.stop()

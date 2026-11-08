@@ -85,6 +85,8 @@ import { parseSmf, writeSmf } from './midi/smf'
 import { createPianoRoll, type PianoRollApi } from './midi/piano-roll'
 import { createStepGrid, type StepGridApi } from './midi/step-grid'
 import { PRESETS, presetNotes } from './midi/step-logic'
+import { HUMANIZE_PRESETS, humanizePreset, humanizeShiftMs, humanizeVel, isDrumTrack, trackFillHeads } from './midi/humanize'
+import { createDebugMonitor } from './ui/debug-monitor'
 import { DRUM_LANES, defaultDrumParams, type DrumParams } from './gpu/instruments/drums'
 import { fmPreset, type FmParams } from './gpu/instruments/fm'
 import { FM_PRESET_NAMES } from './gpu/instruments/fm-presets'
@@ -742,14 +744,17 @@ const midiTrackById = (id: number): MidiTrack | undefined => midiTracks.find((t)
 function instrumentNotes(mt: MidiTrack): InstrumentNote[] {
   const out: InstrumentNote[] = []
   const { bpm, sampleRate: sr } = state
+  const hp = humanizePreset(mt.humanize)
+  const hn = { drum: isDrumTrack(mt), barBeats: (Math.max(1, state.timeSigNum) * 4) / Math.max(1, state.timeSigDen) }
+  const heads = hp && hn.drum ? trackFillHeads(mt.clips) : null
   for (const c of mt.clips) {
     for (const n of c.notes) {
-      const a = beatsToFrames(c.start + n.start, bpm, sr)
+      const a = Math.max(0, beatsToFrames(c.start + n.start, bpm, sr) + (hp ? (humanizeShiftMs(hp, c.start + n.start, mt.humanizeAmount, { ...hn, key: n.key, fillHead: !!heads?.has(n) }) * sr) / 1000 : 0))
       out.push({
         startFrame: Math.round(a),
         endFrame: Math.round(a + beatsToFrames(n.dur, bpm, sr)),
         key: n.key,
-        vel: n.vel
+        vel: hp ? humanizeVel(hp, c.start + n.start, n.vel, mt.humanizeAmount, { ...hn, key: n.key }) : n.vel
       })
     }
   }
@@ -767,6 +772,25 @@ function renderInstrumentLane(lane: Lane, force = false): void {
   const src = clip && getSource(clip.sourceId)
   if (!mt || !mt.instrument || !src) return
   const notes = instrumentNotes(mt)
+  if (lane.live) {
+    // sound comes back from outside (return input): no render, a token buffer, the notes' extent for the transport
+    let end = 0
+    for (const n of notes) end = Math.max(end, n.endFrame)
+    const rsig = `return|${state.sampleRate}|${end}`
+    if (!force && rsig === lane.inst.sig) return
+    if (src.gpu.totalFrames !== 256) {
+      src.gpu.prepare(256, 2)
+      src.gpu.computePeaks()
+    }
+    lane.inst.sig = rsig
+    clip.srcOffset = 0
+    clip.lengthFrames = Math.max(256, end)
+    clip.fadeIn = 0
+    clip.fadeOut = 0
+    lane.dirty = true
+    refreshTotals()
+    return
+  }
   const sig = `${state.sampleRate}|${state.bpm}|${mt.instrument.kind}|${JSON.stringify(mt.instrument.params)}|${notes
     .map((n) => `${n.startFrame},${n.endFrame},${n.key},${n.vel}`)
     .join(';')}`
@@ -830,7 +854,38 @@ const writeNum = (k: string, v: number): void => {
   }
 }
 
-const liveSub = (l: Lane): string => `line · ${l.recIn.stereo ? `In ${l.recIn.ch + 1}-${l.recIn.ch + 2}` : `In ${l.recIn.ch + 1}`}${l.live?.monitor ? '' : ' · monitor off'}`
+const inLabel = (l: Lane): string => (l.recIn.stereo ? `In ${l.recIn.ch + 1}-${l.recIn.ch + 2}` : `In ${l.recIn.ch + 1}`)
+const liveSub = (l: Lane): string => {
+  const mon = l.live?.monitor ? '' : ' · monitor off'
+  if (!l.inst) return `line · ${inLabel(l)}${mon}`
+  const mt = midiTrackById(l.inst.midiTrackId)
+  return `inst · ${mt?.instrument ? instrumentLabel(mt.instrument.kind) : ''} · return ${inLabel(l)}${mon}`
+}
+/** Sub line of an instrument track: its instrument, plus where its sound comes from when it is a return. */
+const instSub = (l: Lane): string => {
+  if (l.live) return liveSub(l)
+  const mt = l.inst ? midiTrackById(l.inst.midiTrackId) : undefined
+  return `inst · ${mt?.instrument ? instrumentLabel(mt.instrument.kind) : ''}`
+}
+
+/**
+ * Where an instrument track's sound comes from: its built-in instrument (rendered into VRAM, null) or a
+ * return input pair (the track's MIDI goes out to an outside instrument and the sound comes back on the
+ * live path, through this same strip + inserts). One or the other; the instrument's settings are kept.
+ */
+function setInstAudio(lane: Lane, ret: { ch: number; stereo: boolean } | null): void {
+  if (!lane.inst) return
+  if (ret) {
+    lane.live = { monitor: lane.live?.monitor ?? true }
+    lane.recIn = { ch: Math.max(0, ret.ch | 0), stereo: ret.stereo }
+  } else {
+    delete lane.live
+  }
+  lane.el.classList.toggle('line', !!lane.live)
+  renderInstrumentLane(lane, true)
+  setLaneSub(lane, instSub(lane))
+  if (selectedId === lane.id) renderDetail()
+}
 
 /** A lane whose audio is live line input, run through the strip + inserts in real time. */
 function addLiveLane(name = 'Line In', ch = 0, stereo = false): Lane {
@@ -887,7 +942,7 @@ function buildLiveSection(lane: Lane): HTMLElement {
     setLaneSub(lane, liveSub(lane))
   })
   chRow.appendChild(sel)
-  sec.appendChild(chRow)
+  if (!lane.inst) sec.appendChild(chRow) // an instrument track picks its return under Instrument, Audio
 
   const mon = document.createElement('label')
   mon.style.cssText = rowCss
@@ -928,10 +983,10 @@ function buildLiveSection(lane: Lane): HTMLElement {
   blkRow.append('Block')
   const blkSel = document.createElement('select')
   blkSel.style.cssText = inCss
-  for (const n of [512, 1024, 2048]) {
+  for (const n of [512, 1024, 2048, 4096]) {
     const o = document.createElement('option')
     o.value = String(n)
-    o.textContent = `${n} fr` + (n === 512 ? ' (lowest latency)' : n === 2048 ? ' (safest)' : '')
+    o.textContent = `${n} fr` + (n === 512 ? ' (lowest latency)' : n === 4096 ? ' (many tracks)' : '')
     blkSel.appendChild(o)
   }
   blkSel.value = String(LIVE_BLOCK)
@@ -1288,18 +1343,23 @@ function addDrumTrack(name = 'Drums', presetName = 'Basic beat', bars = 2): Lane
 }
 
 /** Create the lane that plays `mt` through its instrument (default: the simple synth). */
-function addInstrumentLane(mt: MidiTrack): Lane {
+function addInstrumentLane(mt: MidiTrack, ret?: { ch: number; stereo: boolean }): Lane {
   if (!mt.instrument) mt.instrument = { kind: 'synth', params: defaultSynthParams() }
   const lane = addLane(mt.name)
   lane.inst = { midiTrackId: mt.id, sig: '', timer: 0 }
   lane.el.classList.add('instrument')
+  if (ret) {
+    lane.live = { monitor: true }
+    lane.recIn = { ch: Math.max(0, ret.ch | 0), stereo: ret.stereo }
+    lane.el.classList.add('line')
+  }
   lane.el.addEventListener('dblclick', () => openTrackEditor(mt))
   const src = registerSource({ name: mt.name, path: null, kind: 'inst', gpu: new GpuTrack(), envelope: null })
   const clip = makeClip({ sourceId: src.id, name: mt.name, lengthFrames: 256 })
   retainSource(src.id)
   lane.clips.push(clip)
   renderInstrumentLane(lane, true)
-  setLaneSub(lane, `inst · ${instrumentLabel(mt.instrument.kind)}`)
+  setLaneSub(lane, instSub(lane))
   renderAudioList()
   if (selectedId === lane.id) renderDetail() // addLane selected it before `inst` was set
   return lane
@@ -1318,7 +1378,7 @@ function swapInstrument(lane: Lane, kind: string): void {
   const fresh = stash[kind] ?? makeInstrument(kind)?.params
   if (!fresh) return
   mt.instrument = { kind, params: fresh }
-  setLaneSub(lane, `inst · ${instrumentLabel(kind)}`)
+  setLaneSub(lane, instSub(lane))
   renderInstrumentLane(lane, true)
   renderDetail()
 }
@@ -1343,6 +1403,29 @@ function buildInstrumentPicker(lane: Lane): HTMLElement {
   sel.addEventListener('change', () => swapInstrument(lane, sel.value))
   row.appendChild(sel)
   sec.appendChild(row)
+
+  const arow = document.createElement('label')
+  arow.style.cssText = row.style.cssText
+  arow.title =
+    'Built-in: the instrument renders the sound. Return: the MIDI goes out (MIDI I/O, Out) and the sound comes back on this return input pair, through this same strip and inserts (start the return input below). Return audio is not in bounces / stems yet.'
+  arow.append('Audio')
+  const asel = document.createElement('select')
+  asel.style.cssText = sel.style.cssText
+  const aadd = (v: string, t: string): void => {
+    const o = document.createElement('option')
+    o.value = v
+    o.textContent = t
+    asel.appendChild(o)
+  }
+  aadd('inst', 'Built-in instrument')
+  for (let n = 0; n < 48; n += 2) aadd(`s${n}`, `Return In ${n + 1}-${n + 2}`)
+  if (lane.live && !lane.recIn.stereo) aadd(`m${lane.recIn.ch}`, `Return In ${lane.recIn.ch + 1} (mono)`)
+  asel.value = lane.live ? `${lane.recIn.stereo ? 's' : 'm'}${lane.recIn.ch}` : 'inst'
+  asel.addEventListener('change', () =>
+    setInstAudio(lane, asel.value === 'inst' ? null : { ch: Number(asel.value.slice(1)), stereo: asel.value[0] === 's' })
+  )
+  arow.appendChild(asel)
+  sec.appendChild(arow)
   const hint = document.createElement('div')
   hint.style.cssText = 'font-size:10px;color:var(--dim);line-height:1.4'
   hint.textContent = 'Swap the sound; notes, strip, inserts and fader stay.'
@@ -1397,6 +1480,42 @@ function buildMidiIoSection(lane: Lane): HTMLElement {
   ch.addEventListener('change', () => (mt.channel = Number(ch.value)))
   chRow.appendChild(ch)
   sec.appendChild(chRow)
+
+  const hRow = document.createElement('label')
+  hRow.style.cssText = rowCss
+  hRow.title = 'Groove: shifts notes by their place in the bar (the stored notes stay on the grid)'
+  hRow.append('Humanize')
+  const hs = document.createElement('select')
+  hs.style.cssText = selCss
+  for (const p of HUMANIZE_PRESETS) {
+    const o = document.createElement('option')
+    o.value = p.id
+    o.textContent = p.label
+    hs.appendChild(o)
+  }
+  hs.value = humanizePreset(mt.humanize)?.id ?? 'off'
+  hs.addEventListener('change', () => {
+    mt.humanize = hs.value === 'off' ? undefined : hs.value
+    scheduleInstrumentRender(lane) // the built-in sound is rendered with the shift; MIDI out reads it live
+  })
+  hRow.appendChild(hs)
+  // strength: 0..200 % of the preset's shift
+  const ha = document.createElement('input')
+  ha.type = 'number'
+  ha.min = '0'
+  ha.max = '200'
+  ha.step = '5'
+  ha.value = String(Math.round((mt.humanizeAmount ?? 1) * 100))
+  ha.title = 'Strength: % of the preset shift (100 = as listed)'
+  ha.style.cssText = selCss + ';flex:none;width:52px'
+  ha.addEventListener('change', () => {
+    const v = Math.max(0, Math.min(200, Number(ha.value) || 0))
+    ha.value = String(v)
+    mt.humanizeAmount = v === 100 ? undefined : v / 100
+    scheduleInstrumentRender(lane)
+  })
+  hRow.append(ha, '%')
+  sec.appendChild(hRow)
 
   const dRow = document.createElement('label')
   dRow.style.cssText = rowCss
@@ -1612,6 +1731,7 @@ const clipGainLin = (db: number): number => (db <= -60 ? 0 : Math.pow(10, db / 2
 /** Resolve a lane's clips to render-ready descriptors for the master bus. */
 function resolveLaneClips(lane: Lane): LaneClip[] {
   const out: LaneClip[] = []
+  if (lane.inst && lane.live) return out // its sound is on the live path
   for (const c of lane.clips) {
     const s = getSource(c.sourceId)
     if (!s || !s.gpu.channels[0]) continue
@@ -3454,7 +3574,7 @@ function renderDetail(): void {
   if (lane.live) {
     trackDetailEl.appendChild(buildLiveSection(lane))
     trackDetailEl.appendChild(buildReturnSection(lane))
-    trackDetailEl.appendChild(buildVstSection(lane))
+    if (!lane.inst) trackDetailEl.appendChild(buildVstSection(lane))
   }
 
   const sp = lane.dsp.params
@@ -4095,6 +4215,60 @@ async function boot(): Promise<void> {
   // live (line-input) path: its own small-block bus, fed by main's ~256-frame input batches
   schedulerRef = scheduler
   liveBusRef = scheduler.liveBus = new LiveBus(liveLanes, () => scheduler.masterBus.masterGain)
+
+  // ---- load gauge (top bar): CPU of the app, GPU mix render, live path — each as % of real time ----
+  {
+    const loadEl = $('load')
+    const gauge = (label: string, frac: number, tip: string): string => {
+      const pct = Math.round(frac * 100)
+      const cls = frac >= 1 ? 'g over' : frac >= 0.75 ? 'g hot' : 'g'
+      return `<span class="${cls}" title="${tip}">${label}<span class="bar"><i style="width:${Math.min(100, pct)}%"></i></span>${pct}%</span>`
+    }
+    const tick = async (): Promise<void> => {
+      let cpu = 0
+      let cpuTip = 'CPU: the app (main + window + GPU process), % of the whole machine'
+      try {
+        const c = await window.daw.cpuMetrics()
+        cpu = c.total / Math.max(1, c.cores) / 100
+        cpuTip += ' — ' + Object.entries(c.byType).map(([k, v]) => `${k} ${v.toFixed(0)}%`).join(', ') + ' (% of one core)'
+      } catch {
+        /* main without the handler */
+      }
+      loadEl.innerHTML =
+        gauge('CPU', cpu, cpuTip) +
+        gauge('GPU', scheduler.renderLoad.load, 'GPU mix: playback render time ÷ audio time (over 100% = cannot keep up)') +
+        gauge('Live', liveBusRef?.load.load ?? 0, 'Live path (line inputs / Awaker Mixer): processing time ÷ block time (over 100% = dropouts)')
+      if (dbgOn) {
+        const li = scheduler.liveInfo()
+        const pct = (v: number): number => Math.round(v * 100)
+        window.daw.debugStats({
+          cpuPct: pct(cpu),
+          gpuPct: pct(scheduler.renderLoad.load),
+          livePct: pct(liveBusRef?.load.load ?? 0),
+          liveBlock: LIVE_BLOCK,
+          liveLatencyMs: Math.round(li.latencyMs),
+          liveProcMs: Math.round((li.bus?.procMeanMs ?? 0) * 10) / 10,
+          liveProcMaxMs: Math.round((li.bus?.procMaxMs ?? 0) * 10) / 10,
+          liveDropped: li.bus?.dropped ?? 0,
+          playing: state.playing ? 1 : 0,
+          playheadS: Math.round((scheduler.currentFrame() / state.sampleRate) * 10) / 10
+        })
+      }
+    }
+    window.setInterval(() => void tick(), 1000)
+
+    // ---- debug monitor (View → Debug Monitor / Ctrl+Shift+D): main sends a snapshot once a second ----
+    const dbg = createDebugMonitor(document.body)
+    let dbgOn = false
+    const applyDbg = (st: { on: boolean; file: string }): void => {
+      dbgOn = st.on
+      dbg.setVisible(st.on)
+      dbg.setFile(st.file)
+    }
+    window.daw.onDebug(applyDbg)
+    void window.daw.debugState().then(applyDbg)
+    window.daw.onDebugSnapshot((snap) => dbg.update(snap as Parameters<typeof dbg.update>[0]))
+  }
   liveBusRef.latencyMs = readNum(LIVE_LAT_KEY, 0)
   setLiveBlock(readNum(LIVE_BLOCK_KEY, LIVE_BLOCK))
   scheduler.recOffsetMs = readNum(REC_OFF_KEY, 0)
@@ -4298,7 +4472,8 @@ async function boot(): Promise<void> {
 
     for (const t of p.tracks ?? []) {
       const imt = t.instrumentOf !== undefined && t.instrumentOf >= 0 ? midiTracks[t.instrumentOf] : undefined
-      const lane = imt ? addInstrumentLane(imt) : addLane(t.title || 'Track')
+      const ret = imt && t.live && t.recIn ? { ch: Number(t.recIn.ch) | 0, stereo: !!t.recIn.stereo } : undefined
+      const lane = imt ? addInstrumentLane(imt, ret) : addLane(t.title || 'Track')
 
       if (t.live) {
         lane.live = { monitor: t.live.monitor !== false }
@@ -4428,6 +4603,7 @@ async function boot(): Promise<void> {
         return
       }
       const res = await window.daw.projectSave(snap)
+      if (!res) return // Save As dialog cancelled
       if (res.ok) flashStatus(`project saved · ${res.path}`)
       else flashStatus(`save failed: ${res.error}`, true)
     } catch (err) {
@@ -5220,6 +5396,7 @@ async function boot(): Promise<void> {
         view: { framesPerPixel: 0, scrollFrames: 0, playhead: 0 },
         tracks: []
       })
+      await window.daw.projectNew()
       flashStatus('new project')
     } catch (err) {
       console.error('[project] new failed', err)
@@ -5625,13 +5802,31 @@ async function boot(): Promise<void> {
         }
       }
       if (patch.channel !== undefined) mt.channel = Math.max(1, Math.min(16, Math.round(patch.channel))) - 1
+      if (patch.returnIn !== undefined) {
+        const n = Math.round(patch.returnIn)
+        setInstAudio(lane, n >= 1 ? { ch: Math.min(47, n - 1), stereo: true } : null)
+      }
       if (patch.outDelayMs !== undefined) midiIo.setOutDelay(patch.outDelayMs)
+      if (patch.humanizeAmount !== undefined) {
+        const v = Math.max(0, Math.min(200, patch.humanizeAmount))
+        mt.humanizeAmount = v === 100 ? undefined : v / 100
+        scheduleInstrumentRender(lane)
+      }
+      if (patch.humanize !== undefined) {
+        const id = humanizePreset(patch.humanize.trim())?.id ?? patch.humanize.trim()
+        if (id !== 'off' && !HUMANIZE_PRESETS.some((p) => p.id === id)) throw new Error(`unknown humanize preset "${id}" (${HUMANIZE_PRESETS.map((p) => p.id).join(', ')})`)
+        mt.humanize = id === 'off' ? undefined : id
+        scheduleInstrumentRender(lane)
+      }
       if (selectedId === lane.id) renderDetail()
       return {
         track: laneId,
         out: ports.find((x) => x.id === mt.outId)?.name ?? null,
         channel: mt.channel + 1,
         outDelayMs: midiIo.outDelayMs,
+        humanize: mt.humanize ?? 'off',
+        humanizeAmountPct: Math.round((mt.humanizeAmount ?? 1) * 100),
+        returnIn: lane.live ? lane.recIn.ch + 1 : 0,
         ports: ports.map((x) => x.name)
       }
     },
@@ -5702,6 +5897,9 @@ async function boot(): Promise<void> {
       t.textContent = title
       t.title = title
       ln.strip.el.querySelector('.strip-head .t')!.textContent = title
+      // an instrument lane is named after its MIDI track (that is what a project load rebuilds it from)
+      const mt = ln.inst ? midiTrackById(ln.inst.midiTrackId) : undefined
+      if (mt) mt.name = title
     },
     applyStrip: (l, bypass, patch) => {
       const ln = l as unknown as Lane
@@ -6004,8 +6202,8 @@ async function boot(): Promise<void> {
       }
     }, 250)
   } else {
-    // Startup: if a project was ever saved, relaunch straight into it. Only when
-    // there's none do we fall back to the test-bed autoload.
+    // Startup: reopen the project file that was open last time; with none, a blank project
+    // (plus the test-bed WAVs only when DAW_AUTOLOAD names them).
     void (async () => {
       const saved = await window.daw.projectLoad()
       if (saved && typeof saved === 'object') {
@@ -6146,9 +6344,10 @@ async function boot(): Promise<void> {
     if (masterNow > masterPeakHold) masterPeakHold = masterNow
     const mnorm = Math.max(0, Math.min(1, (linToDb(masterVu) + 54) / 54))
     masterVuEl.style.height = `${(1 - mnorm) * 100}%`
+    // left number = the master fader's value, like a channel strip (follows at once, also when moved by MCP)
+    const masterFaderText = fmtFaderDb(Number(masterEl.value))
+    if (masterDbEl.textContent !== masterFaderText) masterDbEl.textContent = masterFaderText
     if (writeText) {
-      const mdb = linToDb(masterNow)
-      masterDbEl.textContent = mdb === -Infinity ? '−∞' : mdb.toFixed(1)
       const mpk = linToDb(masterPeakHold)
       masterPeakEl.textContent = mpk === -Infinity ? '−∞' : mpk.toFixed(1)
       masterPeakEl.classList.toggle('over', mpk > 0)

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Secondary return audio input (WASAPI shared mode, or a synthetic test generator).
+ * Secondary return audio input (WASAPI shared mode, the Awaker Mixer virtual bus, or a synthetic test
+ * generator).
  *
  * Reads a recording endpoint (such as the recording side of a virtual audio cable fed by a
  * standalone instrument) on its own clock, absorbs clock drift in a ring buffer by nudging a
@@ -13,6 +14,7 @@
 export const RETURN_BLOCK = 512
 const LEAD_BLOCKS = 2
 const MAX_PPM = 500
+const MIXER_MAX_PPM = 5000
 const IMPULSE_PERIOD = 4800
 
 export interface WasapiInputHandle {
@@ -27,7 +29,8 @@ export interface ReturnInDeps {
   clock(): number
   running(): boolean
   rate(): number
-  inject(block: Float32Array, start: number): void
+  /** `channels`-interleaved block (2 unless a multi-pair Mixer read is running). */
+  inject(block: Float32Array, start: number, channels: number): void
   setExternal(on: boolean): void
   setAlignProbe?(on: boolean): void
   openWasapiInput?(
@@ -38,6 +41,15 @@ export interface ReturnInDeps {
     onData: (interleaved: Float32Array, channels: number) => void,
     onError: (msg: string) => void
   ): WasapiInputHandle
+  /** The Awaker Mixer bus (shared memory written by the separate driver), when the audio module has it. */
+  mixer?: MixerBus
+}
+
+/** Reader side of the Awaker Mixer bus (native/audio). */
+export interface MixerBus {
+  info(): { open: boolean; sampleRate?: number; running?: boolean; channels?: number; writeFrames?: number; client?: string }
+  /** Interleaved frames [from, to) of `channels` channels starting at `first` (0-based). */
+  read(from: number, first: number, channels: number): { from: number; to: number; data: Float32Array } | null
 }
 
 export interface ReturnInStartConfig {
@@ -46,11 +58,15 @@ export interface ReturnInStartConfig {
   delayMs?: number
   synthetic?: boolean | 'sine' | 'impulse'
   driftPpm?: number
+  /** Awaker Mixer: the stereo pair to take, 1-based (pair 1 = outputs 1/2 of the instrument). */
+  mixerPair?: number
+  /** Awaker Mixer: how many consecutive pairs from `mixerPair` (pair k → channels 2k, 2k+1 of the live input). */
+  mixerPairs?: number
 }
 
 export interface ReturnInStatus {
   running: boolean
-  mode: 'off' | 'wasapi' | 'synthetic'
+  mode: 'off' | 'wasapi' | 'synthetic' | 'mixer'
   deviceId: number
   deviceName: string
   sampleRate: number
@@ -84,8 +100,7 @@ export class DriftRing {
   private writePos = 0
   private readPos = 0
   private phase = 0
-  private lastL = 0
-  private lastR = 0
+  private readonly last: Float32Array
   smoothFill = 0
   integPpm = 0
   ppm = 0
@@ -93,10 +108,17 @@ export class DriftRing {
   underruns = 0
   overruns = 0
 
-  constructor(capFrames = 16384, targetFrames = 4096) {
+  constructor(
+    capFrames = 16384,
+    targetFrames = 4096,
+    readonly channels = 2,
+    /** How far the resampler may lean to absorb clock drift. */
+    private readonly maxPpm = MAX_PPM
+  ) {
     this.cap = Math.max(1024, capFrames | 0)
     this.target = Math.max(256, Math.min(this.cap >> 1, targetFrames | 0))
-    this.buf = new Float32Array(this.cap * 2)
+    this.buf = new Float32Array(this.cap * channels)
+    this.last = new Float32Array(channels)
     this.reset()
   }
 
@@ -113,8 +135,7 @@ export class DriftRing {
     this.writePos = this.target + Math.max(0, extraLead | 0)
     this.readPos = 0
     this.phase = 0
-    this.lastL = 0
-    this.lastR = 0
+    this.last.fill(0)
     this.smoothFill = this.target
     this.integPpm = 0
     this.ppm = 0
@@ -138,12 +159,10 @@ export class DriftRing {
       }
     }
 
+    const n = this.channels
     for (let i = 0; i < frames; i++) {
-      const p = ((this.writePos + i) % this.cap) * 2
-      const l = interleaved[i * ch]
-      const r = ch > 1 ? interleaved[i * ch + 1] : l
-      this.buf[p] = l
-      this.buf[p + 1] = r
+      const p = ((this.writePos + i) % this.cap) * n
+      for (let c = 0; c < n; c++) this.buf[p + c] = interleaved[i * ch + Math.min(c, ch - 1)] // mono input → every channel
     }
     this.writePos += frames
 
@@ -162,8 +181,8 @@ export class DriftRing {
     const scale = Math.max(256, this.target * 0.25)
     const err = (this.smoothFill - this.target) / scale
     const dt = outFrames / Math.max(1, outSampleRate)
-    this.integPpm = Math.max(-MAX_PPM, Math.min(MAX_PPM, this.integPpm + err * 15 * dt))
-    this.ppm = Math.max(-MAX_PPM, Math.min(MAX_PPM, err * 350 + this.integPpm))
+    this.integPpm = Math.max(-this.maxPpm, Math.min(this.maxPpm, this.integPpm + err * 15 * dt))
+    this.ppm = Math.max(-this.maxPpm, Math.min(this.maxPpm, err * 350 + this.integPpm))
     const ratio = nominalRatio * (1 + this.ppm * 1e-6)
     this.lastRatio = ratio
 
@@ -171,24 +190,20 @@ export class DriftRing {
     if (this.available < needIn) {
       this.underruns++
       const pad = Math.max(Math.ceil(needIn - this.available) + 16, this.target - Math.floor(this.available))
-      for (let i = 0; i < pad; i++) {
-        const p = ((this.writePos + i) % this.cap) * 2
-        this.buf[p] = this.lastL
-        this.buf[p + 1] = this.lastR
-      }
+      for (let i = 0; i < pad; i++) this.buf.set(this.last, ((this.writePos + i) % this.cap) * this.channels)
       this.writePos += pad
     }
 
+    const n = this.channels
     for (let i = 0; i < outFrames; i++) {
-      const p0 = (this.readPos % this.cap) * 2
-      const p1 = ((this.readPos + 1) % this.cap) * 2
+      const p0 = (this.readPos % this.cap) * n
+      const p1 = ((this.readPos + 1) % this.cap) * n
       const f = this.phase
-      const l = this.buf[p0] + f * (this.buf[p1] - this.buf[p0])
-      const r = this.buf[p0 + 1] + f * (this.buf[p1 + 1] - this.buf[p0 + 1])
-      dst[i * 2] = l
-      dst[i * 2 + 1] = r
-      this.lastL = l
-      this.lastR = r
+      for (let c = 0; c < n; c++) {
+        const v = this.buf[p0 + c] + f * (this.buf[p1 + c] - this.buf[p0 + c])
+        dst[i * n + c] = v
+        this.last[c] = v
+      }
       this.phase += ratio
       const adv = Math.floor(this.phase)
       this.readPos += adv
@@ -201,7 +216,10 @@ export class DriftRing {
 
 export class ReturnIn {
   private handle: WasapiInputHandle | null = null
-  private mode: 'off' | 'wasapi' | 'synthetic' = 'off'
+  private mode: 'off' | 'wasapi' | 'synthetic' | 'mixer' = 'off'
+  private mixerFirst = 0
+  private mixerPos = -1
+  private mixerTimer: NodeJS.Timeout | null = null
   private synthKind: 'sine' | 'impulse' = 'sine'
   private driftPpm = 0
   private deviceId = 0
@@ -272,6 +290,32 @@ export class ReturnIn {
       this.synthGenerated = 0
       this.synthFrameBase = 0
       this.synthTimer = setInterval(() => this.tickSynthetic(), 4)
+    } else if (cfg.mixerPair !== undefined) {
+      const bus = this.deps.mixer
+      const info = bus?.info()
+      if (!bus || !info?.open) {
+        this.error = 'Awaker Mixer is not running (no host has opened the driver)'
+        return this.status()
+      }
+      const maxPairs = Math.floor((info.channels ?? 48) / 2)
+      const pair = Math.max(1, Math.min(maxPairs, Math.floor(Number(cfg.mixerPair)) || 1))
+      const pairs = Math.max(1, Math.min(maxPairs - pair + 1, Math.floor(Number(cfg.mixerPairs)) || 1))
+      this.mode = 'mixer'
+      this.mixerFirst = (pair - 1) * 2
+      this.mixerPos = -1
+      this.inRate = info.sampleRate || outRate
+      this.channels = pairs * 2
+      this.deviceId = pair
+      this.deviceName = `Awaker Mixer ${pair * 2 - 1}-${(pair + pairs - 1) * 2}${info.client ? ` (${info.client})` : ''}`
+      const cap = Math.max(8192, Math.round(this.inRate * 0.25))
+      const target = Math.max(1024, Math.round(this.inRate * 0.045))
+      // the PoC driver runs on its own timer, measured ~1300 ppm off the interface clock: give it room
+      this.ring = new DriftRing(cap, target, this.channels, MIXER_MAX_PPM)
+      this.deps.setExternal(true)
+      this.deps.setAlignProbe?.(false)
+      // PoC: polled from the main thread. The driver writes on its own clock; the ring absorbs the drift.
+      this.mixerTimer = setInterval(() => this.tickMixer(), 2)
+      console.log(`[return-in] reading ${this.deviceName} @ ${this.inRate} Hz`)
     } else {
       if (!this.deps.openWasapiInput) {
         this.error = 'WASAPI input opener is not configured'
@@ -330,6 +374,10 @@ export class ReturnIn {
       clearInterval(this.synthTimer)
       this.synthTimer = null
     }
+    if (this.mixerTimer) {
+      clearInterval(this.mixerTimer)
+      this.mixerTimer = null
+    }
     if (this.logTimer) {
       clearInterval(this.logTimer)
       this.logTimer = null
@@ -384,6 +432,14 @@ export class ReturnIn {
     this.peakR = Math.max(pr, this.peakR * 0.95)
     this.receivedFrames += frames
     this.ring.push(interleaved, ch, this.deps.running())
+  }
+
+  private tickMixer(): void {
+    if (this.mode !== 'mixer' || !this.deps.mixer) return
+    const r = this.deps.mixer.read(this.mixerPos < 0 ? Number.MAX_SAFE_INTEGER : this.mixerPos, this.mixerFirst, this.channels)
+    if (!r) return
+    if (this.mixerPos >= 0 && r.data.length > 0) this.feedInput(r.data, this.channels) // first read only finds the position
+    this.mixerPos = r.to
   }
 
   private tickSynthetic(): void {
@@ -463,11 +519,12 @@ export class ReturnIn {
         this.ring.ppm = 0
         this.ring.integPpm = 0
         this.ring.lastRatio = 1
-        this.deps.inject(out, this.produced)
+        this.deps.inject(out, this.produced, 2)
       } else {
-        const out = new Float32Array(RETURN_BLOCK * 2)
+        const n = this.ring.channels
+        const out = new Float32Array(RETURN_BLOCK * n)
         this.ring.pull(RETURN_BLOCK, outRate, out, nominalRatio)
-        this.deps.inject(out, this.produced)
+        this.deps.inject(out, this.produced, n)
       }
       this.produced += RETURN_BLOCK
       this.injectedFrames += RETURN_BLOCK

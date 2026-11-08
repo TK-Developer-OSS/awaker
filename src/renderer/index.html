@@ -113,6 +113,13 @@
         white-space: nowrap;
       }
       #metrics .warn { color: #ffb454; }
+      #load { display: inline-flex; gap: 10px; font-variant-numeric: tabular-nums; font-size: 11px; color: var(--dim); white-space: nowrap; }
+      #load .g { display: inline-flex; align-items: center; gap: 4px; }
+      #load .bar { width: 36px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+      #load .bar i { display: block; height: 100%; width: 0; background: var(--play); }
+      #load .hot .bar i { background: #ffb454; }
+      #load .over .bar i { background: #ff4d4d; }
+      #load .over { color: #ff4d4d; }
 
 
       /* ---- transport bar (bottom, like a DAW's transport panel): icon-only buttons, clocks at the left ---- */
@@ -1360,6 +1367,7 @@
         <span class="fmt">· 32f</span>
       </label>
       <span id="metrics"></span>
+      <span id="load" title="load"></span>
       <!-- transient messages grow into the free space on the left of the spacer, so nothing to their right ever moves -->
       <span id="gpu-status"></span>
       <span class="spacer"></span>
@@ -1401,7 +1409,7 @@
             <div class="strip-vu"><i></i></div>
           </div>
           <div class="strip-nums">
-            <div class="strip-db" id="master-db" title="master level">−∞</div>
+            <div class="strip-db" id="master-db" title="master fader (dB)">−∞</div>
             <div class="strip-peak" id="master-peak" title="peak — click to reset">−∞</div>
           </div>
           <div class="strip-lufs" id="master-lufs" title="short-term loudness — BS.1770 K-weighting + provisional +2 dB trim (almost, pending reference check)">−∞</div>

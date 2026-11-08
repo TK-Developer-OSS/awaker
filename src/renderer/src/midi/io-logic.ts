@@ -9,6 +9,7 @@
  */
 
 import type { MidiTrack } from './model'
+import { humanizePreset, humanizeShiftMs, humanizeVel, isDrumTrack, trackFillHeads } from './humanize'
 
 export interface OutEvent {
   trackId: number
@@ -28,16 +29,22 @@ export function planWindow(
   audible: (t: MidiTrack) => boolean,
   fromFrame: number,
   toFrame: number,
-  beatsToFrames: (beats: number) => number
+  beatsToFrames: (beats: number) => number,
+  /** Frames per millisecond, for the humanizer's shift (0 = no humanizing). */
+  framesPerMs = 0
 ): OutEvent[] {
   const out: OutEvent[] = []
   for (const t of tracks) {
     if (!t.outId || !audible(t)) continue
+    const hp = humanizePreset(t.humanize)
+    const drum = isDrumTrack(t)
+    const heads = hp && drum ? trackFillHeads(t.clips) : null
     for (const c of t.clips) {
       for (const n of c.notes) {
-        const on = beatsToFrames(c.start + n.start)
-        const off = beatsToFrames(c.start + n.start + n.dur)
-        if (on >= fromFrame && on < toFrame) out.push({ trackId: t.id, frame: on, kind: 'on', key: n.key, vel: n.vel })
+        const shift = hp ? humanizeShiftMs(hp, c.start + n.start, t.humanizeAmount, { key: n.key, drum, fillHead: !!heads?.has(n) }) * framesPerMs : 0
+        const on = Math.max(0, beatsToFrames(c.start + n.start) + shift)
+        const off = Math.max(on + 1, beatsToFrames(c.start + n.start + n.dur) + shift)
+        if (on >= fromFrame && on < toFrame) out.push({ trackId: t.id, frame: on, kind: 'on', key: n.key, vel: hp ? humanizeVel(hp, c.start + n.start, n.vel, t.humanizeAmount, { key: n.key, drum }) : n.vel })
         if (off >= fromFrame && off < toFrame) out.push({ trackId: t.id, frame: off, kind: 'off', key: n.key, vel: 0 })
       }
     }

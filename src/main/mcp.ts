@@ -7,6 +7,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 import { ipcMain, type BrowserWindow } from 'electron'
+import { setProjectDoc } from './project-doc'
 
 /**
  * Built-in MCP server (dev / regression aid) — lets an AI drive the *running* app:
@@ -165,7 +166,7 @@ const TOOLS: ToolSpec[] = [
     where: 'renderer',
     description:
       'Route an instrument / MIDI track to the outside: `out` = the name (or part of it) of a MIDI output port, or "none"; `channel` 1-16; `outDelayMs` = the app-wide MIDI output delay in ms (negative = send MIDI earlier, to line up an external instrument whose audio comes back late). Returns the resulting settings and the ports found.',
-    inputSchema: obj({ track: num('track id (the instrument lane)'), out: str('output port name or part of it, or "none"'), channel: num('MIDI channel 1-16'), outDelayMs: num('app-wide MIDI out delay, ms (-200..500)') }, ['track'])
+    inputSchema: obj({ track: num('track id (the instrument lane)'), out: str('output port name or part of it, or "none"'), channel: num('MIDI channel 1-16'), outDelayMs: num('app-wide MIDI out delay, ms (-200..500)'), humanize: str('groove preset: off | rock8 ("Rock Dr 8-Bt", drum tracks: kick on 1 on the grid; 8th off-beats, the snare on 4 and the head of tom fills 2 ms early; that snare about 10 % softer)'), humanizeAmount: num('humanizer strength in % of the preset (0..200, 100 = as listed)'), returnIn: num('where the sound comes from: 0 = the built-in instrument; n = return input pair n, n+1 (1-based first channel, e.g. 3 = In 3-4): the MIDI goes out and the sound comes back through this track strip') }, ['track'])
   },
   {
     name: 'midi_track_add',
@@ -573,8 +574,10 @@ const TOOLS: ToolSpec[] = [
     name: 'return_start',
     where: 'main',
     description:
-      'Start the secondary WASAPI shared-mode return input (or a synthetic sine/impulse test source) and route it into the live path with drift compensation. Pick a device by `deviceId` (from audio_inputs) or `deviceName`, or pass `synthetic: true | "sine" | "impulse"` (and optional `driftPpm`) for verification.',
+      'Start the secondary WASAPI shared-mode return input (or a synthetic sine/impulse test source) and route it into the live path with drift compensation. Pick a device by `deviceId` (from audio_inputs) or `deviceName`, or pass `synthetic: true | "sine" | "impulse"` (and optional `driftPpm`) for verification, or `mixerPair` to take a stereo pair from the Awaker Mixer virtual bus.',
     inputSchema: obj({
+      mixerPair: num('Awaker Mixer: stereo pair, 1-based (1 = the instrument outputs 1/2, 2 = 3/4, ...)'),
+      mixerPairs: num('Awaker Mixer: how many consecutive pairs from mixerPair (pair k arrives as live-input channels 2k-1/2k: one line-input track per pair)'),
       deviceId: num('WASAPI input device id from audio_inputs'),
       deviceName: str('substring of the WASAPI input device name'),
       delayMs: num('manual delay offset in ms (-100..500)'),
@@ -760,7 +763,9 @@ async function runMainTool(name: string, args: Record<string, unknown>, deps: Mc
           deviceName: typeof args['deviceName'] === 'string' ? args['deviceName'] : undefined,
           delayMs: args['delayMs'] !== undefined ? Number(args['delayMs']) : undefined,
           synthetic: syn === 'impulse' ? 'impulse' : syn === 'sine' || syn === true || syn === 'true' ? 'sine' : false,
-          driftPpm: args['driftPpm'] !== undefined ? Number(args['driftPpm']) : undefined
+          driftPpm: args['driftPpm'] !== undefined ? Number(args['driftPpm']) : undefined,
+          mixerPair: args['mixerPair'] !== undefined ? Number(args['mixerPair']) : undefined,
+          mixerPairs: args['mixerPairs'] !== undefined ? Number(args['mixerPairs']) : undefined
         })
       )
     }
@@ -825,7 +830,9 @@ async function runMainTool(name: string, args: Record<string, unknown>, deps: Mc
       const path = String(args['path'] ?? '')
       if (!path.toLowerCase().endsWith('.json')) throw new Error('path must end in .json')
       const proj = JSON.parse(await readFile(path, 'utf8'))
-      return text(await callRenderer(win, 'project_load', { project: proj }))
+      const res = await callRenderer(win, 'project_load', { project: proj })
+      await setProjectDoc(path) // like File → Open: Save writes back to this file
+      return text(res)
     }
   }
   throw new Error(`unknown main tool ${name}`)

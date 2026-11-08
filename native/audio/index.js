@@ -205,4 +205,24 @@ function nativeFile() {
   return found.file
 }
 
-module.exports = { RtAudio, RtAudioApi, RtAudioFormat, RtAudioStreamFlags, RtAudioErrorType, compiledApis, nativeFile }
+/**
+ * Reader of the Awaker Mixer bus (a virtual audio bus written into shared memory by the separate Awaker Mixer
+ * driver). null when this native build predates it.
+ */
+const mixer =
+  typeof native.mixerRead === 'function'
+    ? {
+        info: () => native.mixerInfo(),
+        read(from, first, channels) {
+          const r = native.mixerRead(from, first, channels)
+          if (!r || !r.data) return null
+          // copy into an aligned Float32Array (a Buffer's offset need not be a multiple of 4)
+          const f = new Float32Array(r.data.length / 4)
+          new Uint8Array(f.buffer).set(r.data)
+          return { from: r.from, to: r.to, data: f }
+        },
+        close: () => native.mixerClose()
+      }
+    : null
+
+module.exports = { RtAudio, RtAudioApi, RtAudioFormat, RtAudioStreamFlags, RtAudioErrorType, compiledApis, nativeFile, mixer }

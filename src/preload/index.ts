@@ -79,22 +79,25 @@ const api = {
   /** Test-bed: WAV paths to auto-load on startup (empty if disabled). */
   autoloadWavs: (): Promise<string[]> => ipcRenderer.invoke('daw:autoloadWavs'),
 
-  /** Restore the last-saved project (canonical file), or null if none. */
+  /** On start: the project file that was open last time, or null (= start on a blank project). */
   projectLoad: (): Promise<unknown | null> => ipcRenderer.invoke('daw:project:load'),
 
-  /** Save the project to the canonical file (relaunch restores it). */
+  /** A new project: no open document, so the next Save asks where. */
+  projectNew: (): Promise<void> => ipcRenderer.invoke('daw:project:new'),
+
+  /** Save the project to the open document (File → Open / Save As); with none, asks where like Save As (null = cancelled). */
   projectSave: (
     data: unknown
-  ): Promise<{ ok: true; path: string } | { ok: false; error: string }> =>
+  ): Promise<{ ok: true; path: string } | { ok: false; error: string } | null> =>
     ipcRenderer.invoke('daw:project:save', data),
 
-  /** Save-as via a native dialog; also refreshes the canonical file. */
+  /** Save-as via a native dialog; the chosen file becomes the open document. */
   projectExport: (
     data: unknown
   ): Promise<{ ok: true; path: string } | { ok: false; error: string } | null> =>
     ipcRenderer.invoke('daw:project:export', data),
 
-  /** Open a project file via a native dialog; also refreshes the canonical file. */
+  /** Open a project file via a native dialog; it becomes the open document. */
   projectImport: (): Promise<unknown | null> => ipcRenderer.invoke('daw:project:import'),
 
   /** Import a .dawproject (Cubase 14+): returns project.xml text + extracted WAV paths, null if cancelled. */
@@ -275,10 +278,25 @@ const api = {
   vstScan: (): Promise<{ name: string; path: string }[]> => ipcRenderer.invoke('daw:vst:scan'),
   vstMidi: (events: { t: number; st: number; d1: number; d2: number }[]): void => ipcRenderer.send('daw:vst:midi', events),
 
+  /** Debug monitor: on/off, the session log file, the window's own stats (once a second), events. */
+  debugState: (): Promise<{ on: boolean; file: string }> => ipcRenderer.invoke('daw:debug:state'),
+  debugSet: (on: boolean): Promise<{ on: boolean; file: string }> => ipcRenderer.invoke('daw:debug:set', on),
+  debugStats: (s: Record<string, unknown>): void => ipcRenderer.send('daw:debug:stats', s),
+  debugEvent: (text: string): void => ipcRenderer.send('daw:debug:event', text),
+  onDebug: (cb: (s: { on: boolean; file: string }) => void): void => {
+    ipcRenderer.on('daw:debug', (_e, s) => cb(s))
+  },
+  onDebugSnapshot: (cb: (s: { out: unknown; ret: unknown; win: unknown; events: string[]; file: string }) => void): void => {
+    ipcRenderer.on('daw:debug:snapshot', (_e, s) => cb(s))
+  },
+
+  /** CPU use of the app's processes (% of one core; summed by process type). */
+  cpuMetrics: (): Promise<{ total: number; byType: Record<string, number>; cores: number }> => ipcRenderer.invoke('daw:metrics:cpu'),
+
   /** Secondary WASAPI return input (virtual audio cable return): start, stop, delay offset, status. */
   returnStatus: (): Promise<{
     running: boolean
-    mode: 'off' | 'wasapi' | 'synthetic'
+    mode: 'off' | 'wasapi' | 'synthetic' | 'mixer'
     deviceId: number
     deviceName: string
     sampleRate: number

@@ -536,9 +536,9 @@ export class NativeAudioOut {
   get rate(): number {
     return this.sampleRate
   }
-  /** One block of an external live source (interleaved f32 stereo) captured at `start` on the output clock. */
-  injectLive(f: Float32Array, start: number): void {
-    this.liveIn(f, start, 2)
+  /** One block of an external live source (interleaved f32, `nCh` channels) captured at `start` on the output clock. */
+  injectLive(f: Float32Array, start: number, nCh = 2): void {
+    this.liveIn(f, start, nCh)
   }
 
   /** The renderer turns this on while it has live lanes; off = no per-callback cost. */

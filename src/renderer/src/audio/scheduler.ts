@@ -3,6 +3,7 @@
 // Generated with Claude Code (https://claude.com/claude-code)
 
 import type { AudioOutStatus, RecChunk } from '../../../preload/index'
+import { LoadMeter } from './load-meter'
 import { Recorder, type RecTarget, type Take } from './recorder'
 import { LiveBus } from './live-bus'
 import { MasterBus, type MixGroup, type MixSource } from '../gpu/master-bus'
@@ -77,6 +78,8 @@ export interface BounceResult {
 const EMPTY_PEAKS = new Float32Array(0)
 
 export class PlaybackScheduler {
+  /** Playback render time ÷ audio time (the GPU mix path, incl. readback). */
+  readonly renderLoad = new LoadMeter()
   readonly masterBus: MasterBus
   private timer: number | null = null
   private busy = false
@@ -170,10 +173,15 @@ export class PlaybackScheduler {
     return this.getSources().filter((s) => s.clips.length > 0)
   }
 
-  /** Transport end = the furthest clip edge across all lanes. */
+  /** Something to play: rendered clips, or tracks whose sound comes back live (return instruments: no clips, only an extent). */
+  private hasContent(): boolean {
+    return this.ready().length > 0 || state.totalFrames > 0
+  }
+
+  /** Transport end = the furthest clip edge across all lanes (the host's total also covers return instrument tracks). */
   private totalFrames(): number {
     if (this.rec) return Number.MAX_SAFE_INTEGER // recording runs until Stop, past the last clip
-    let m = 0
+    let m = Math.max(0, state.totalFrames || 0)
     for (const s of this.ready()) {
       for (const c of s.clips) m = Math.max(m, c.startFrame + c.lengthFrames)
     }
@@ -657,7 +665,7 @@ export class PlaybackScheduler {
 
   async start(fromFrame: number, rec?: { inputChannels: number; synthetic: boolean }): Promise<void> {
     if (state.playing) return
-    if (!this.ready().length && !this.rec) return
+    if (!this.hasContent() && !this.rec) return
     // Cancel any lingering insert tail from a previous stop.
     if (this.tailing || this.timer !== null) await this.finish()
 
@@ -835,7 +843,9 @@ export class PlaybackScheduler {
     const total = this.totalFrames()
     const src = this.ready() // track set is stable within a fill burst
     while (this.scheduledFrame < total && this.bufferedNow() < bufferedTargetFrames) {
+      const t0 = performance.now()
       const block = await this.masterBus.renderBlock(src, this.scheduledFrame, BLOCK_FRAMES, state.sampleRate, this.getGroups())
+      this.renderLoad.add(performance.now() - t0, (BLOCK_FRAMES / state.sampleRate) * 1000)
       let pk = 0
       for (let j = 0; j < block.length; j++) {
         const a = block[j] < 0 ? -block[j] : block[j]
@@ -852,7 +862,7 @@ export class PlaybackScheduler {
 
   private async pump(): Promise<void> {
     if (this.busy) return
-    if (!this.ready().length && !this.rec) return
+    if (!this.hasContent() && !this.rec) return
     const sr = state.sampleRate
     const target = TARGET_LOOKAHEAD_S * sr
     const topupAt = target - MIN_TOPUP_S * sr

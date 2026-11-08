@@ -3,6 +3,7 @@
 // Generated with Claude Code (https://claude.com/claude-code)
 
 import { getGpu } from '../gpu/device'
+import { LoadMeter } from './load-meter'
 import { MasterBus, type MixSource, type TrackMix } from '../gpu/master-bus'
 import type { ChannelStrip } from '../gpu/channel-strip'
 import type { Insert } from '../gpu/insert'
@@ -58,6 +59,8 @@ export interface LiveStats {
 }
 
 export class LiveBus {
+  /** Live-path processing time ÷ block time. */
+  readonly load = new LoadMeter()
   private readonly bus = new MasterBus()
   private chunks: Float32Array[] = []
   private accFrames = 0
@@ -66,6 +69,7 @@ export class LiveBus {
   private channels = 0
   private queue: { start: number; data: Float32Array }[] = []
   private inflight = 0
+  private busySince = 0
   private bufs = new Map<number, { l: GPUBuffer; r: GPUBuffer }>()
   private procSum = 0
   private procMax = 0
@@ -228,11 +232,15 @@ export class LiveBus {
   private drain(sr: number): void {
     while (this.queue.length && this.inflight < LIVE_DEPTH) {
       const b = this.queue.shift()!
+      if (this.inflight === 0) this.busySince = performance.now()
       this.inflight++
       this.process(b.start, b.data, sr)
         .catch((err) => console.error('[live] block failed:', err))
         .finally(() => {
           this.inflight--
+          // load = time with any block in flight (blocks overlap, so per-block times would count twice)
+          this.load.add(this.inflight === 0 ? performance.now() - this.busySince : 0, (LIVE_BLOCK / sr) * 1000)
+          if (this.inflight === 0) this.busySince = 0
           this.drain(sr)
         })
     }

@@ -54,6 +54,10 @@ export interface MidiTrack {
    * every render.
    */
   instrument: { kind: string; params: object } | null
+  /** Groove humanizer preset id (`humanize.ts`); undefined / 'off' = on the grid. */
+  humanize?: string
+  /** Humanizer strength, 0..2 (1 = the preset as written); undefined = 1. */
+  humanizeAmount?: number
   /** Runtime only (not saved): params of instruments this track has been switched away from, so switching back restores them. */
   stash?: Record<string, object>
 }
@@ -153,6 +157,8 @@ export interface SzMidiTrack {
   outId: string | null
   inId: string | null
   instrument?: { kind: string; params: object } | null
+  humanize?: string
+  humanizeAmount?: number
   clips: { name: string; start: number; length: number; notes: { start: number; dur: number; key: number; vel: number }[] }[]
 }
 
@@ -165,6 +171,8 @@ export function serializeMidi(): SzMidiTrack[] {
     outId: t.outId,
     inId: t.inId,
     instrument: t.instrument ? { kind: t.instrument.kind, params: structuredClone(t.instrument.params) } : null,
+    ...(t.humanize && t.humanize !== 'off' ? { humanize: t.humanize } : {}),
+    ...(t.humanizeAmount !== undefined && t.humanizeAmount !== 1 ? { humanizeAmount: t.humanizeAmount } : {}),
     clips: t.clips.map((c) => ({
       name: c.name,
       start: c.start,
@@ -185,6 +193,8 @@ export function restoreMidi(src: SzMidiTrack[] | undefined): void {
     t.instrument = st.instrument
       ? { kind: normalizeInstrumentKind(String(st.instrument.kind)), params: structuredClone(st.instrument.params ?? {}) }
       : null
+    if (typeof st.humanize === 'string') t.humanize = st.humanize
+    if (Number.isFinite(st.humanizeAmount)) t.humanizeAmount = Math.max(0, Math.min(2, Number(st.humanizeAmount)))
     for (const sc of st.clips ?? []) {
       const c = addMidiClip(t, Number(sc.start) || 0, Number(sc.length) || 4, String(sc.name ?? 'MIDI'))
       for (const sn of sc.notes ?? []) addNote(c, Number(sn.start) || 0, Number(sn.dur) || 0.25, Number(sn.key) | 0, Number(sn.vel) | 0 || 100)

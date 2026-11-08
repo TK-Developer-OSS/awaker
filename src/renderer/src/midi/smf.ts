@@ -78,7 +78,8 @@ export function parseSmf(bytes: Uint8Array): SmfData {
   const ppq = division || 480
   if (format > 1 && ntrks > 1) throw new Error('format 2 (independent sequences) is not supported')
 
-  let bpm = 0
+  const tempos: { tick: number; bpm: number }[] = []
+  let maxTick = 0
   let tempoChanges = 0
   let timeSig = { num: 4, den: 4 }
   let haveSig = false
@@ -117,7 +118,7 @@ export function parseSmf(bytes: Uint8Array): SmfData {
           const us = (r.u8() << 16) | (r.u8() << 8) | r.u8()
           if (us > 0) {
             tempoChanges++
-            if (!bpm) bpm = 60_000_000 / us
+            tempos.push({ tick, bpm: 60_000_000 / us })
           }
         } else if (type === 0x58 && mlen >= 2) {
           const num = r.u8()
@@ -130,7 +131,9 @@ export function parseSmf(bytes: Uint8Array): SmfData {
         r.pos = mend
         if (type === 0x2f) break
       } else if (st === 0xf0 || st === 0xf7) {
-        r.pos += r.vlq()
+        // length first: `r.pos += r.vlq()` reads pos before vlq() advances it and drops the length bytes
+        const slen = r.vlq()
+        r.pos += slen
       } else {
         const hi = st & 0xf0
         const ch = st & 0x0f
@@ -159,6 +162,7 @@ export function parseSmf(bytes: Uint8Array): SmfData {
       }
     }
     r.pos = end
+    maxTick = Math.max(maxTick, tick)
     if (notes.length === 0) continue
     notes.sort((a, b) => a.tick - b.tick || a.key - b.key)
     // one MIDI channel per track: split a multi-channel track (format 0 files)
@@ -169,6 +173,18 @@ export function parseSmf(bytes: Uint8Array): SmfData {
         channel: c,
         notes: notes.filter((n) => n.channel === c)
       })
+    }
+  }
+  // The project has one fixed tempo: take the one that covers the most ticks (a short count-in at another
+  // tempo must not decide it). Ties go to the earlier one.
+  tempos.sort((a, b) => a.tick - b.tick)
+  let bpm = 0
+  let bestSpan = -1
+  for (let i = 0; i < tempos.length; i++) {
+    const span = (i + 1 < tempos.length ? tempos[i + 1].tick : Math.max(maxTick, tempos[i].tick)) - tempos[i].tick
+    if (span > bestSpan) {
+      bestSpan = span
+      bpm = tempos[i].bpm
     }
   }
   return { ppq, bpm: bpm || 120, tempoChanges, timeSig, tracks: out }
